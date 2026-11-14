@@ -5,6 +5,17 @@ Everything we add lives here; upstream lives untouched in `../mirofish` (pinned 
 > Status: Phase 2 (memory layer decided: local adapter). This README will be completed in Phase 6.
 > Nothing here is validated against real outcomes, and local models weaken persona quality.
 
+## Set up on a new machine
+
+Requirements: macOS or Linux (Windows via WSL), Git, [uv](https://docs.astral.sh/uv/), Node.js 18+, [Ollama](https://ollama.com/download), and about 24 GB of GPU or unified memory for the default model (choose a smaller one in `config/model.conf` otherwise).
+
+```bash
+git clone https://github.com/sajjants/mirofish-implementation.git && cd mirofish-implementation
+ops/scripts/bootstrap.sh --with-models   # clone upstream at the pin, patch, install, .env, tests, models (~19 GB), doctor
+```
+
+`bootstrap.sh` is idempotent; without `--with-models` it skips the model download. It installs only from the lockfiles (`uv sync --frozen`, `npm ci --ignore-scripts`) and never runs upstream's own setup scripts.
+
 ## Layout
 
 | Path | Purpose |
@@ -21,6 +32,7 @@ Everything we add lives here; upstream lives untouched in `../mirofish` (pinned 
 | `scripts/build_model.sh` | Pull the chat and embedding GGUFs through Ollama and create the aliases with a large context |
 | `scripts/doctor.sh` | Check Ollama install, reachability, loopback bind, memory, model, context, JSON compliance, throughput, embeddings |
 | `scripts/doctor_llm.py` | LLM checks used by `doctor.sh` (stdlib only) |
+| `scripts/bootstrap.sh` | One-command, idempotent setup on a new machine (see above) |
 | `scripts/apply_patches.sh` | Apply, check or revert `patches/` against the pinned upstream commit |
 | `patches/` | Re-applicable patches to upstream; listed in `UPSTREAM.md` |
 | `tests/` | Wrapper tests (`python3 -m unittest discover -s ops/tests -t ops/tests`) |

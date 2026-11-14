@@ -38,14 +38,14 @@ The script refuses to run unless `mirofish` is at the pinned commit. `--revert` 
 
 | Patch | Purpose | Upstream files touched | New files |
 |---|---|---|---|
-| `0001-local-memory-backend.patch` | Option (a) of `ZEP_DECISION.md`: local graph memory selected by `MIROFISH_MEMORY_BACKEND=local` | `backend/app/config.py` (backend switch, placeholder key; in local mode, validation that `LLM_BASE_URL` and any `LLM_BOOST_BASE_URL` are loopback), `backend/app/utils/zep.py` (factory switch; ingestion wait raised from 600 s to 7,200 s in local mode) | `backend/app/local_graph/` (9 modules), `backend/tests/test_local_graph.py` (24 tests) |
+| `0001-local-memory-backend.patch` | Option (a) of `ZEP_DECISION.md`: local graph memory selected by `MIROFISH_MEMORY_BACKEND=local` | `backend/app/config.py` (backend switch, placeholder key; in local mode, validation that `LLM_BASE_URL` and any `LLM_BOOST_BASE_URL` are loopback), `backend/app/utils/zep.py` (factory switch; ingestion wait raised from 600 s to 7,200 s in local mode) | `backend/app/local_graph/` (9 modules), `backend/tests/test_local_graph.py` (24 tests), `backend/tests/conftest.py` (stops tests reading `mirofish/.env`, so a local setup cannot change what upstream's Zep tests exercise) |
 
 Verified on 2026-11-14: the patch applies to a pristine `git archive` of the pinned commit, and the backend suite passes there (154 tests: 130 upstream + 24 adapter). With `MIROFISH_MEMORY_BACKEND` unset, upstream behaviour (Zep Cloud) is unchanged.
 
 To regenerate the patch after editing the adapter inside `mirofish/`:
 
 ```bash
-git -C mirofish add -N backend/app/local_graph backend/tests/test_local_graph.py
+git -C mirofish add -N backend/app/local_graph backend/tests/test_local_graph.py backend/tests/conftest.py
 git -C mirofish diff --binary HEAD -- backend ':(exclude)backend/**/__pycache__/**' > ops/patches/0001-local-memory-backend.patch
 git -C mirofish reset -q
 ```

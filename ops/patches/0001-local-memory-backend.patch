@@ -1901,6 +1901,28 @@ index c8bd4c9..e02f221 100644
      # zep-cloud gives ZEP_API_URL precedence even when base_url is explicit.
      # Reject it so this Cloud-only integration cannot silently target a
      # self-hosted or compatibility endpoint.
+diff --git a/backend/tests/conftest.py b/backend/tests/conftest.py
+new file mode 100644
+index 0000000..142bf28
+--- /dev/null
++++ b/backend/tests/conftest.py
+@@ -0,0 +1,16 @@
++"""Keep the test suite hermetic: never read the developer's mirofish/.env.
++
++app/config.py loads .env with override=True at import, so a local setup
++(for example MIROFISH_MEMORY_BACKEND=local) would otherwise change what the
++Zep Cloud client tests exercise.
++"""
++
++import os
++
++import dotenv
++
++dotenv.load_dotenv = lambda *args, **kwargs: False
++
++for _name in list(os.environ):
++    if _name == "MIROFISH_MEMORY_BACKEND" or _name.startswith("LOCAL_GRAPH_"):
++        del os.environ[_name]
 diff --git a/backend/tests/test_local_graph.py b/backend/tests/test_local_graph.py
 new file mode 100644
 index 0000000..22e9c16
