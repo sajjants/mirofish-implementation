@@ -1,0 +1,47 @@
+# ----- Upstream and third-party checkouts (re-cloned from ops/UPSTREAM.md) -----
+mirofish/
+_review/
+
+# ----- Secrets and runtime configuration -----
+.env
+.env.*
+!.env.example
+ops/config/*.env
+!ops/config/*.env.example
+
+# ----- Private inputs and run artefacts -----
+seeds/
+outputs/
+ops/seeds/
+ops/outputs/
+ops/logs/
+ops/runs/
+
+# ----- Pseudonymisation and variant mappings (never commit) -----
+*.mapping.json
+*.mapping.yaml
+mappings/
+ops/mappings/
+
+# ----- Caches -----
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+node_modules/
+.cache/
+ops/cache/
+hf_cache/
+tiktoken_cache/
+
+# ----- OS / editor -----
+.DS_Store
+.cursor/
+
+# ----- Machine-local generated state -----
+ops/state/
+
+# ----- Project-local tools (Ollama CLI) -----
+.tools/

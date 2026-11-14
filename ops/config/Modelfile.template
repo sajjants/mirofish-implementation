@@ -1,0 +1,9 @@
+# Rendered by ops/scripts/build_model.sh from ops/config/model.conf.
+# __HF_MODEL_REF__ and __NUM_CTX__ are substituted at build time.
+FROM __HF_MODEL_REF__
+
+# Graph-enriched persona and report prompts exceed Ollama's small default context.
+PARAMETER num_ctx __NUM_CTX__
+
+# Temperature is intentionally not set: MiroFish passes its own per call, and OASIS
+# agents use the model default when none is passed.

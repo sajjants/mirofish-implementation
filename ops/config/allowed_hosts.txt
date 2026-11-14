@@ -1,0 +1,3 @@
+# Non-loopback hosts netcheck.sh may tolerate, one hostname per line.
+# Empty under the fully local path. Under the Zep Cloud fallback this would contain:
+#   api.getzep.com
