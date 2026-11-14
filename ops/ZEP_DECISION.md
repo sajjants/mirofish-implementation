@@ -156,18 +156,18 @@ After that, `ops/config/allowed_hosts.txt` stays **empty** and `netcheck.sh` mus
 
 ### 3.1 Confirmed for the chosen path (a)
 
-Confirmed by reading the patched code. `netcheck.sh` (Phase 3) will add the measured result here.
+Confirmed by reading the patched code, then **measured** by `ops/scripts/netcheck.sh` on 2026-11-14 (run `phase3-pilot-01`: synthetic seed, ontology → graph → 7 personas → 10 rounds on Twitter and Reddit in parallel → report, about 7 minutes). Every Python-level connect and DNS lookup by the backend and the simulation subprocess was logged (74 events), and the backend, frontend, their descendants and Ollama were sampled with `lsof` every second (3,035 socket samples). Result: **PASS**. The only destinations were `127.0.0.1:11434` (Ollama) and `127.0.0.1:5001` (the backend's own bind); the Twitter recommender model and tiktoken encodings loaded from `ops/cache` with `HF_HUB_OFFLINE=1`; Ollama opened no non-loopback sockets during the run.
 
 **MiroFish backend process at runtime:**
 
 | Host | When | Carries seed content? |
 |---|---|---|
 | `127.0.0.1:11434` | always: chat (`/v1/chat/completions`), embeddings (`/api/embed`) | yes, loopback only |
-| `huggingface.co` and its CDN | only if a Twitter simulation runs before `Twitter/twhin-bert-base` is cached; never once `HF_HUB_OFFLINE=1` | no |
+| `huggingface.co` and its CDN | only if a Twitter simulation runs before `Twitter/twhin-bert-base` is cached. `ops/scripts/cache_assets.sh` caches it and sets `HF_HUB_OFFLINE=1`; the `ops/runtime` shim then keeps `transformers` from making its one remaining online lookup | no |
 | `openaipublic.blob.core.windows.net` | only if tiktoken encodings are not cached in `TIKTOKEN_CACHE_DIR` | no |
 | `api.getzep.com` | **never**: `get_zep_client()` returns the local client before the Cloud client is constructed (tested in `test_local_backend_needs_no_zep_key_and_never_builds_cloud_client`) | — |
 
-**Browser (frontend):** `fonts.googleapis.com` and `fonts.gstatic.com` until the Phase 3 font patch. They receive your IP and the page referrer, not seed content.
+**Browser (frontend):** none. Patch 0002 removed the Google Fonts links (`fonts.googleapis.com`, `fonts.gstatic.com`).
 
 **Ollama server process** (separate from MiroFish, but on the same machine):
 
@@ -176,7 +176,7 @@ Confirmed by reading the patched code. `netcheck.sh` (Phase 3) will add the meas
 | `hf.co` / `huggingface.co` and CDN | only during `ops/scripts/build_model.sh` (model pull) | no |
 | `ollama.com` | a "model recommendations" catalog fetch scheduled every few hours (seen in `ops/logs/ollama.log`, `model_recommendations.go`). `OLLAMA_NO_CLOUD=1` disables cloud models but **not** this fetch, and v0.40.16 exposes no setting to turn it off | no; it is a catalog download. It does reveal your IP and Ollama version to ollama.com |
 
-If you want the Ollama fetch blocked as well, it needs an OS-level outbound firewall rule for the Ollama binary. That is a machine policy decision for you, so I have not made it; `netcheck.sh` will report it separately from MiroFish's own traffic.
+If you want the Ollama fetch blocked as well, it needs an OS-level outbound firewall rule for the Ollama binary. That is a machine policy decision for you, so I have not made it. Because Ollama receives every prompt, `netcheck.sh` fails if Ollama has any non-loopback socket while the pilot runs; if the catalog fetch happens to coincide with a pilot, re-run it (the report names the remote address).
 
 ## 4. Sub-decisions that come with (a) (defaults in brackets)
 

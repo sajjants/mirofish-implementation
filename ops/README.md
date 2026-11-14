@@ -2,7 +2,7 @@
 
 Everything we add lives here; upstream lives untouched in `../mirofish` (pinned in `UPSTREAM.md`). Changes to upstream are only ever applied from `patches/`.
 
-> Status: Phase 2 (memory layer decided: local adapter). This README will be completed in Phase 6.
+> Status: Phase 3 done (loopback-only, offline, network-checked, purgeable). This README will be completed in Phase 6.
 > Nothing here is validated against real outcomes, and local models weaken persona quality.
 
 ## Set up on a new machine
@@ -14,7 +14,22 @@ git clone https://github.com/sajjants/mirofish-implementation.git && cd mirofish
 ops/scripts/bootstrap.sh --with-models   # clone upstream at the pin, patch, install, .env, tests, models (~19 GB), doctor
 ```
 
-`bootstrap.sh` is idempotent; without `--with-models` it skips the model download. It installs only from the lockfiles (`uv sync --frozen`, `npm ci --ignore-scripts`) and never runs upstream's own setup scripts.
+`bootstrap.sh` is idempotent; without `--with-models` it skips the model download. It installs only from the lockfiles (`uv sync --frozen`, `npm ci --ignore-scripts`) and never runs upstream's own setup scripts. It also caches the two files the simulation would otherwise download at runtime (about 1.1 GB, `--skip-assets` to defer) and switches `.env` to offline mode.
+
+## Run, check, delete
+
+```bash
+ops/scripts/start.sh            # backend 127.0.0.1:5001 and UI http://127.0.0.1:3000; refuses non-loopback config
+ops/scripts/stop.sh             # stops both, including simulation subprocesses (--ollama to stop Ollama too)
+ops/scripts/netcheck.sh         # pilot run with network auditing: 0 PASS, 1 FAIL (violation or no evidence), 2 pilot incomplete
+ops/scripts/injection_check.py RUN_ID   # did instruction text in the seed steer the run? (ops/INJECTION_TEST.md)
+ops/scripts/purge.sh RUN_ID     # shred a run's project, graph, simulation, report and evidence (--logs: all logs too)
+python3 ops/scripts/mirofish_api.py run --run-id ID --seed seed.md --requirement-file q.txt --max-rounds 10
+```
+
+Runs are recorded in `ops/runs/<RUN_ID>/manifest.json` (mode 0600, directory 0700). Re-running the same `RUN_ID` resumes after the last completed stage. Data directories under `ops/` are created with 0700 permissions.
+
+Last network check (2026-11-14, full pilot on both platforms): **PASS**. Every connection from MiroFish went to 127.0.0.1 (details in `ZEP_DECISION.md` §3.1).
 
 ## Layout
 
@@ -34,8 +49,20 @@ ops/scripts/bootstrap.sh --with-models   # clone upstream at the pin, patch, ins
 | `scripts/doctor_llm.py` | LLM checks used by `doctor.sh` (stdlib only) |
 | `scripts/bootstrap.sh` | One-command, idempotent setup on a new machine (see above) |
 | `scripts/apply_patches.sh` | Apply, check or revert `patches/` against the pinned upstream commit |
+| `scripts/envfile.py` | Add missing keys to, set, or read `mirofish/.env` (atomic, mode 600) |
+| `scripts/cache_assets.sh` | Download `Twitter/twhin-bert-base` and tiktoken encodings into `cache/`, then set `.env` offline |
+| `scripts/start.sh`, `scripts/stop.sh` | Start/stop MiroFish on loopback with tracing and proxy variables scrubbed |
+| `scripts/mirofish_api.py` | Stdlib REST client and resumable one-run pipeline (loopback only) |
+| `scripts/netcheck.sh`, `scripts/netcheck.py` | Pilot run with audit hook and `lsof` sampling; evaluation against `config/allowed_hosts.txt` |
+| `scripts/purge.sh`, `scripts/purge.py` | Overwrite-then-delete everything a run produced |
+| `scripts/injection_check.py` | Measure whether seed instruction text influenced each stage |
+| `runtime/sitecustomize.py` | Offline tokenizer fix for locked `transformers`, and the network-audit hook (see `UPSTREAM.md`) |
+| `docker/` | Compose override with no internet egress (untested; see `NOTES.md` §10) |
+| `INJECTION_TEST.md` | Seed injection test: method, result, mitigations |
+| `tests/fixtures/` | Synthetic seed (with injection canaries) and question used by `netcheck.sh` |
+| `runs/`, `cache/`, `logs/` | Run manifests and evidence, offline model cache, logs (all git-ignored, 0700) |
 | `patches/` | Re-applicable patches to upstream; listed in `UPSTREAM.md` |
-| `tests/` | Wrapper tests (`python3 -m unittest discover -s ops/tests -t ops/tests`) |
+| `tests/` | Wrapper tests (`python3 -m unittest discover -s ops/tests`) |
 | `state/` | Machine-local generated state, e.g. `hardware_profile.json` (git-ignored) |
 
 ## Quick check of the local LLM (Phase 2)

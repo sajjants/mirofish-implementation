@@ -1,0 +1,108 @@
+diff --git a/backend/app/__init__.py b/backend/app/__init__.py
+index aba624b..750bab4 100644
+--- a/backend/app/__init__.py
++++ b/backend/app/__init__.py
+@@ -40,7 +40,18 @@ def create_app(config_class=Config):
+         logger.info("=" * 50)
+     
+     # 启用CORS
+-    CORS(app, resources={r"/api/*": {"origins": "*"}})
++    # MIROFISH_CORS_ORIGINS / MIROFISH_ALLOWED_HOSTS (comma-separated) lock a local install to
++    # its own frontend and Host names, so other web pages and DNS-rebinding cannot read the API.
++    cors_origins = [o.strip() for o in os.environ.get('MIROFISH_CORS_ORIGINS', '*').split(',') if o.strip()]
++    CORS(app, resources={r"/api/*": {"origins": cors_origins if cors_origins != ['*'] else '*'}})
++    allowed_hosts = {h.strip().lower() for h in os.environ.get('MIROFISH_ALLOWED_HOSTS', '').split(',') if h.strip()}
++    log_request_bodies = os.environ.get('MIROFISH_LOG_REQUEST_BODIES', 'true').lower() == 'true'
++
++    if allowed_hosts:
++        @app.before_request
++        def reject_unknown_host():
++            if (request.host or '').lower() not in allowed_hosts:
++                return {'success': False, 'error': 'host not allowed'}, 403
+     
+     # 注册模拟进程清理函数（确保服务器关闭时终止所有模拟进程）
+     from .services.simulation_runner import SimulationRunner
+@@ -53,7 +64,7 @@ def create_app(config_class=Config):
+     def log_request():
+         logger = get_logger('mirofish.request')
+         logger.debug(f"请求: {request.method} {request.path}")
+-        if request.content_type and 'json' in request.content_type:
++        if log_request_bodies and request.content_type and 'json' in request.content_type:
+             logger.debug(f"请求体: {request.get_json(silent=True)}")
+     
+     @app.after_request
+diff --git a/backend/tests/test_local_hardening.py b/backend/tests/test_local_hardening.py
+new file mode 100644
+index 0000000..ff50f5d
+--- /dev/null
++++ b/backend/tests/test_local_hardening.py
+@@ -0,0 +1,55 @@
++"""Opt-in hardening switches in create_app (MIROFISH_CORS_ORIGINS, MIROFISH_ALLOWED_HOSTS,
++MIROFISH_LOG_REQUEST_BODIES). Unset, upstream behaviour is unchanged."""
++
++import logging
++
++from app import create_app
++
++LOCAL_ORIGIN = "http://127.0.0.1:3000"
++
++
++def _client(monkeypatch, **env):
++    for name in ("MIROFISH_CORS_ORIGINS", "MIROFISH_ALLOWED_HOSTS", "MIROFISH_LOG_REQUEST_BODIES"):
++        monkeypatch.delenv(name, raising=False)
++    for name, value in env.items():
++        monkeypatch.setenv(name, value)
++    return create_app().test_client()
++
++
++def test_defaults_keep_upstream_behaviour(monkeypatch):
++    client = _client(monkeypatch)
++    response = client.get("/api/graph/project/list", headers={"Origin": "https://evil.example", "Host": "evil.example"})
++    assert response.status_code != 403
++    # flask-cors echoes any origin when configured with "*": every web page can read the API.
++    assert response.headers.get("Access-Control-Allow-Origin") == "https://evil.example"
++
++
++def test_cors_is_limited_to_configured_origins(monkeypatch):
++    client = _client(monkeypatch, MIROFISH_CORS_ORIGINS=f"{LOCAL_ORIGIN},http://localhost:3000")
++    allowed = client.get("/api/graph/project/list", headers={"Origin": LOCAL_ORIGIN})
++    assert allowed.headers.get("Access-Control-Allow-Origin") == LOCAL_ORIGIN
++    other = client.get("/api/graph/project/list", headers={"Origin": "https://evil.example"})
++    assert "Access-Control-Allow-Origin" not in other.headers
++
++
++def test_unknown_host_header_is_rejected(monkeypatch):
++    client = _client(monkeypatch, MIROFISH_ALLOWED_HOSTS="127.0.0.1:5001,localhost:5001")
++    assert client.get("/health", headers={"Host": "127.0.0.1:5001"}).status_code == 200
++    assert client.get("/health", headers={"Host": "LOCALHOST:5001"}).status_code == 200
++    rebound = client.get("/health", headers={"Host": "attacker.example:5001"})
++    assert rebound.status_code == 403
++    assert rebound.get_json() == {"success": False, "error": "host not allowed"}
++
++
++def test_request_bodies_are_not_logged_when_disabled(monkeypatch, caplog):
++    marker = "seed-derived-text-7f3a"
++    client = _client(monkeypatch, MIROFISH_LOG_REQUEST_BODIES="false")
++    request_logger = logging.getLogger("mirofish.request")
++    request_logger.addHandler(caplog.handler)
++    try:
++        with caplog.at_level(logging.DEBUG, logger="mirofish.request"):
++            client.post("/api/report/chat", json={"message": marker})
++    finally:
++        request_logger.removeHandler(caplog.handler)
++    assert marker not in caplog.text
++    assert "/api/report/chat" in caplog.text
+diff --git a/frontend/index.html b/frontend/index.html
+index 0b80095..43c1a33 100644
+--- a/frontend/index.html
++++ b/frontend/index.html
+@@ -2,9 +2,6 @@
+ <html lang="zh">
+   <head>
+     <script>document.documentElement.lang = localStorage.getItem('locale') || 'zh'</script>
+-    <link rel="preconnect" href="https://fonts.googleapis.com">
+-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@100..800&family=Noto+Sans+SC:wght@300;400;500;700;800;900&family=Space+Grotesk:wght@300..700&display=swap" rel="stylesheet">
+     <meta charset="UTF-8" />
+     <link rel="icon" type="image/png" href="/icon.png" />
+     <meta name="viewport" content="width=device-width, initial-scale=1.0" />

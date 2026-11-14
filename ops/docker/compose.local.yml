@@ -1,0 +1,79 @@
+# Compose override: MiroFish + Ollama on an internal network with no internet egress.
+# UNTESTED: Docker was not installed on the machine where this was written. Needs Docker
+# Compose v2.24.4+ (for the !reset / !override tags).
+#
+#   ops/docker/make_env.sh                       # writes ops/docker/mirofish.docker.env from mirofish/.env
+#   OLLAMA_MODELS_DIR=$HOME/.ollama/models \
+#   docker compose -f mirofish/docker-compose.yml -f ops/docker/compose.local.yml up --build
+#
+# Layout:
+#   ollama    owns the network namespace; attached only to `internal` (internal: true, so no
+#             route to the internet). Listens on 127.0.0.1 inside that namespace.
+#   mirofish  built from the pinned, patched source (not ghcr.io/...:latest); shares the ollama
+#             namespace (network_mode: service:ollama), so LLM_BASE_URL=http://127.0.0.1:11434/v1
+#             still works and the loopback guard in patch 0001 holds. No network of its own.
+#   gateway   stdlib TCP forwarder from the same image; the only service on `edge`. Publishes
+#             127.0.0.1:3000 and 127.0.0.1:5001 on the host and relays to the internal namespace.
+#             Ports cannot be published from an internal-only network, hence this hop.
+#
+# Models are not pulled inside the stack (no egress). Pull them beforehand with native
+# Ollama (ops/scripts/build_model.sh) and mount that model directory.
+# macOS: containers cannot use the Apple GPU, so Ollama in Docker runs on CPU only and is
+# far slower than the native setup. Prefer native mode (ops/scripts/start.sh) on a Mac.
+name: mirofish-local
+
+services:
+  ollama:
+    image: ollama/ollama:${OLLAMA_IMAGE_TAG:-0.40.16}
+    # Docker's embedded DNS still answers service names, but forwards other lookups to this
+    # upstream, where nothing listens. Older Engines forwarded internal-network lookups to the
+    # host's resolver, which could leak names; nothing in this namespace needs external DNS.
+    dns: ["127.0.0.1"]
+    environment:
+      OLLAMA_HOST: 127.0.0.1:11434
+      OLLAMA_NO_CLOUD: "1"
+    volumes:
+      - ${OLLAMA_MODELS_DIR:?set OLLAMA_MODELS_DIR to the host directory holding your Ollama models}:/root/.ollama/models
+    networks: [internal]
+    restart: unless-stopped
+
+  mirofish:
+    image: mirofish-local:7657031
+    build:
+      context: .
+      dockerfile: Dockerfile
+    pull_policy: build
+    network_mode: "service:ollama"
+    ports: !reset []
+    depends_on: [ollama]
+    env_file: !override
+      - ../ops/docker/mirofish.docker.env
+    environment:
+      PYTHONPATH: /app/ops-runtime
+      UV_OFFLINE: "1"
+      UV_FROZEN: "1"
+      BROWSER: none
+    volumes: !override
+      - ./backend/uploads:/app/backend/uploads
+      # The backend loads /app/.env with override=True, so the Docker variant must be mounted there.
+      - ../ops/docker/mirofish.docker.env:/app/.env:ro
+      - ../ops/cache:/app/ops-cache:ro
+      - ../ops/runtime:/app/ops-runtime:ro
+
+  gateway:
+    image: mirofish-local:7657031
+    pull_policy: never
+    depends_on: [mirofish]
+    command: ["python", "/fwd/tcp_forward.py", "3000=ollama:3000", "5001=ollama:5001"]
+    volumes:
+      - ../ops/docker/tcp_forward.py:/fwd/tcp_forward.py:ro
+    ports:
+      - "127.0.0.1:3000:3000"
+      - "127.0.0.1:5001:5001"
+    networks: [internal, edge]
+    restart: unless-stopped
+
+networks:
+  internal:
+    internal: true
+  edge: {}

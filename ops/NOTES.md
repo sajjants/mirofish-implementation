@@ -229,6 +229,16 @@ Every response is `{"success": bool, "data": {...}, "error": "..."}`. Send `Acce
 7. Simulation subprocess inherits all secrets in its environment.
 8. Seed text is fed verbatim into ontology, extraction, persona and report prompts. There is no separation of instructions from data, so instruction-injection in a seed is plausible. To be tested in Phase 3.
 
+**Phase 3 status (2026-11-14):**
+1. Done: `.env` sets `FLASK_HOST=127.0.0.1`; `start.sh` refuses any other value and checks the listening sockets after startup.
+2. Done without a patch: `start.sh` runs `vite --host 127.0.0.1 --strictPort` directly, with `BROWSER=none`.
+3. Done in `ops/docker/compose.local.yml` (internal network, loopback-only published ports, built from the pinned source). Untested: Docker is not installed here.
+4. Done: patch 0002 (`MIROFISH_CORS_ORIGINS`, plus a `Host` allow-list against DNS rebinding). Verified live: a foreign `Origin` gets no CORS header and a foreign `Host` gets 403.
+5. Done: patch 0002 removes the Google Fonts links.
+6. Partly addressed: `MIROFISH_LOG_REQUEST_BODIES=false` (patch 0002) stops request-body logging. Other DEBUG lines (entity names, progress messages) still reach `backend/logs/`, so `purge.sh --logs` shreds all logs.
+7. Accepted: the only secrets in the environment are a dummy `LLM_API_KEY` and Flask's `SECRET_KEY`. `start.sh` removes tracing, telemetry and proxy variables first.
+8. Tested: see `ops/INJECTION_TEST.md`. Embedded commands were not obeyed, but injected assertions became graph facts, and the report described an injected "actor" as if it had posted.
+
 ## 11. Implications for the wrapper (Phases 2 and 4)
 
 - **Rounds:** set `max_rounds` on `/start`. `OASIS_DEFAULT_MAX_ROUNDS` does nothing. Because `max_rounds` only truncates, the planner's value is an upper bound; the actual rounds may be fewer if the LLM's time config yields fewer.

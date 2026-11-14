@@ -45,3 +45,4 @@ ops/state/
 
 # ----- Project-local tools (Ollama CLI) -----
 .tools/
+ops/docker/mirofish.docker.env
