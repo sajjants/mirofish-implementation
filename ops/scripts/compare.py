@@ -122,12 +122,19 @@ def aggregate(runs: List[Dict], unknowns: List[Dict]) -> Dict:
                 choice = (run["variant"].get(unknown["id"]) or {})
                 table[f"[{choice.get('index')}] {choice.get('text', '?')}"][run["labels"][0]["trajectory"]] += 1
             tables[unknown["id"]] = {"text": unknown["text"], "rows": {k: dict(v) for k, v in table.items()}}
-        variant_keys = Counter(json.dumps(r["variant"], sort_keys=True) for r in items)
+        same_seed: Dict[str, List[Dict]] = defaultdict(list)
+        for run in items:
+            same_seed[json.dumps([run["variant"], run.get("rounds")], sort_keys=True)].append(run)
         warnings = [f"{len(items)} run(s): frequencies are anecdotes, not probabilities"] if len(items) < 5 else []
         if not all(agree):
             warnings.append(f"labeller disagreed with itself on {agree.count(False)} of {len(items)} run(s); "
                             "those labels are unreliable")
-        if max(variant_keys.values()) < 2:
+        for group in same_seed.values():
+            outcomes = sorted({r["labels"][0]["trajectory"] for r in group})
+            if len(outcomes) > 1:
+                warnings.append(f"runs with an identical seed and round count ({', '.join(r['run_id'] for r in group)}) "
+                                f"ended differently ({', '.join(outcomes)}): results are mostly model noise")
+        if max(len(group) for group in same_seed.values()) < 2:
             warnings.append("no variant was run twice, so differences between runs mix the effect of the UNKNOWN "
                             "values with the model's own randomness; they cannot be separated")
         out[question] = {"runs": len(items), "trajectories": dict(Counter(labels)), "labeller_agreement": agree.count(True),
@@ -173,7 +180,7 @@ def compare(batch_id: str, llm: LocalLLM, rubric: Dict, include_pilot: bool = Fa
         info = manifest["batch"]
         labels = [classify(llm, rubric, questions[info["question"]], transcript, seed=p) for p in range(passes)]
         runs.append({"run_id": run_id, "question": info["question"], "variant": info["variant"]["choices"],
-                     "labels": labels})
+                     "rounds": manifest["inputs"]["max_rounds"], "labels": labels})
     summary = aggregate(runs, unknowns)
     result = {"batch_id": batch_id, "rubric": rubric, "passes": passes, "model": llm.model, "summary": summary, "runs": runs}
     markdown = format_markdown(batch_id, summary, runs)

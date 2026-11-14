@@ -239,6 +239,10 @@ class Batch:
     def preflight(self) -> None:
         if not self.client.health():
             raise BatchError("MiroFish is not answering; start it with ops/scripts/start.sh")
+        backend = env_values().get("MIROFISH_MEMORY_BACKEND", "")
+        if backend != "local" and not self.inputs.get("pseudonymized"):
+            raise BatchError(f"MIROFISH_MEMORY_BACKEND is '{backend}', not 'local', so the seed would go to Zep "
+                             "Cloud; only a pseudonymised batch (prepare_inputs.py --terms) may run that way")
         if not self.check_meter:
             return
         port = model_conf().get("LLM_METER_PORT", "11435")

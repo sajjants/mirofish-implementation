@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Check the local LLM setup: Ollama installed, reachable, loopback-only, memory budget,
 # model present with a large context, structured-JSON compliance, and throughput.
-# Writes the hardware profile used by plan.py to ops/state/hardware_profile.json.
+# Writes the hardware profile to ops/state/hardware_profile.json (for reference; plan.py uses
+# the pilot's measurements instead).
 #
 # Usage: ops/scripts/doctor.sh [--skip-bench]
 set -uo pipefail
@@ -26,6 +27,10 @@ ollama_port="${OLLAMA_HOST##*:}"
 ollama_addr="${OLLAMA_HOST%:*}"
 if [[ "$ollama_addr" != "127.0.0.1" && "$ollama_addr" != "localhost" ]]; then
     fail "OLLAMA_HOST in model.conf is '$OLLAMA_HOST'; it must be 127.0.0.1:<port>"
+fi
+sync_reason="$(cloud_sync_reason)"
+if [[ -n "$sync_reason" ]]; then
+    warn "project folder looks cloud-synced: $sync_reason. Seeds, runs and mappings would be uploaded; move the project or exclude it from sync"
 fi
 
 # --- 1. Ollama binary ---

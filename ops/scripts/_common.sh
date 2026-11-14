@@ -22,3 +22,23 @@ make_private_dir() {
     mkdir -p "$1"
     chmod 700 "$1"
 }
+
+# Print why the project directory looks cloud-synced (seeds and runs would be uploaded), or nothing.
+# Heuristic: known sync locations and marker files in the real path or any of its parents.
+cloud_sync_reason() {
+    local dir
+    dir="$(cd -P "$PROJECT_ROOT" && pwd)"
+    case "$dir/" in
+        */Library/CloudStorage/*) echo "it is under ~/Library/CloudStorage (Google Drive, OneDrive or Dropbox)"; return ;;
+        */Library/Mobile\ Documents/*) echo "it is in iCloud Drive"; return ;;
+    esac
+    while [[ -n "$dir" && "$dir" != "/" ]]; do
+        if [[ -e "$dir/.tmp.driveupload" ]]; then
+            echo "Google Drive is backing up $dir (found $dir/.tmp.driveupload)"; return
+        fi
+        if [[ -e "$dir/.dropbox" || -e "$dir/.dropbox.cache" ]]; then
+            echo "Dropbox is syncing $dir"; return
+        fi
+        dir="$(dirname "$dir")"
+    done
+}

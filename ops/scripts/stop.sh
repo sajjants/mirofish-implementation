@@ -34,6 +34,12 @@ stop_one() {
     pid="$(cat "$pidfile")"
     command="$(ps -p "$pid" -o command= 2>/dev/null || true)"
     if [[ -z "$command" ]]; then
+        if kill -0 "$pid" 2>/dev/null; then
+            # Alive but not inspectable (e.g. ps restricted by a sandbox): keep the PID file.
+            echo "$name: pid $pid is running but its command line cannot be read; not stopped" >&2
+            failed=1
+            return 0
+        fi
         rm -f "$pidfile"
         return 0
     fi
@@ -62,6 +68,8 @@ stop_one() {
     echo "$name stopped (pid $pid)"
 }
 
+failed=0
 for name in "${names[@]}"; do
     stop_one "$name"
 done
+exit "$failed"

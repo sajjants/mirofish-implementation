@@ -64,6 +64,9 @@ for key in LLM_BASE_URL LLM_BOOST_BASE_URL LOCAL_GRAPH_EMBED_URL; do
     value="$(env_get "$key")"
     [[ -z "$value" ]] || is_loopback "$(url_host "$value")" || fail "$key in $ENV_FILE is not a loopback URL"
 done
+# Any other memory backend is upstream's Zep Cloud, which would upload the seed (ops/ZEP_DECISION.md).
+[[ "$(env_get MIROFISH_MEMORY_BACKEND)" == "local" ]] \
+    || fail "MIROFISH_MEMORY_BACKEND in $ENV_FILE must be 'local'; anything else sends the seed to Zep Cloud"
 forbidden="$(python3 - "$ENV_FILE" "$OPS_DIR/scripts" <<'EOF'
 import re, sys
 sys.path.insert(0, sys.argv[2])
@@ -79,6 +82,9 @@ EOF
 if [[ "$(env_get HF_HUB_OFFLINE)" != "1" ]]; then
     echo "WARN: HF_HUB_OFFLINE is not 1; run ops/scripts/cache_assets.sh or the Twitter simulation will download from huggingface.co" >&2
 fi
+sync_reason="$(cloud_sync_reason)"
+[[ -z "$sync_reason" ]] || echo "WARN: project folder looks cloud-synced: $sync_reason." \
+    "Seeds, runs and mappings would leave this machine; move the project or exclude it from sync." >&2
 
 # --- Scrub the process environment: only .env and this script decide what the backend sees. ---
 while IFS= read -r name; do

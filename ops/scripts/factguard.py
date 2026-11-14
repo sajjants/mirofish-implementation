@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Flag report claims that the seed does not support.
+"""Flag report and transcript claims that the seed does not support.
 
   factguard.py --batch BATCH_ID [--include-pilot] [--no-llm]
   factguard.py --run RUN_ID [--no-llm]
 
-For each finished run (report.md, de-pseudonymised first when the batch was pseudonymised):
+For each finished run (report.md and transcript.json, de-pseudonymised first when the batch was
+pseudonymised), in the report:
   UNSUPPORTED_NUMBER  a figure (amounts, percentages, counts > 10) not in the original seed or the
                       run's scenario assumptions (within 1%)
   UNSUPPORTED_DATE    a date or year not in the seed
@@ -14,8 +15,11 @@ For each finished run (report.md, de-pseudonymised first when the batch was pseu
   UNKNOWN_STANCE      a sentence settles one of the seed's UNKNOWNs in a way that does not match
                       the variant sampled for this run (judged by the local LLM; --no-llm lists
                       the candidate sentences as UNKNOWN_REVIEW instead)
-Results: ops/runs/<RUN_ID>/factguard.json and factguard.md (0600). Headings are skipped for the
-entity check. English month names only. A flag means "check this", not "this is false".
+In the agents' posts, quotes and comments: UNSUPPORTED_NUMBER, _DATE and _ENTITY as above (agent
+names count as known, hashtags and @mentions are ignored), each value once.
+Results (0600): ops/runs/<RUN_ID>/factguard.json, factguard.md, and report.annotated.md (the report
+with **[FLAG]** after each flagged item). Headings are skipped for the entity check. English
+month names only. A flag means "check this", not "this is false".
 """
 
 from __future__ import annotations
@@ -44,6 +48,8 @@ DATE_PATTERNS = [
     (re.compile(r"\b(?P<y>(?:19|20)\d\d)-(?P<mn>\d\d)-(?P<d>\d\d)\b"), "iso"),
     (re.compile(r"(?<![\d,.$€£])(?P<y>(?:19|20)\d\d)(?![\d%]|[.,]\d|\s?(?:percent|million|billion)\b)"), "y"),
 ]
+# "21 November" / "November 21" without a year: not checkable as a date, but its day is not a figure.
+DAY_MONTH = re.compile(rf"\b\d{{1,2}}(?:st|nd|rd|th)?\s+{MONTH_RE}\b|\b{MONTH_RE}\s+\d{{1,2}}(?:st|nd|rd|th)?\b")
 NUMBER_RE = re.compile(
     r"(?<![\w.\-/:])(?P<cur>[$€£¥]\s?)?(?P<num>\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)"
     r"(?![\-/:]|\.\d)(?:\s?(?P<scale>thousand|million|billion|trillion|bn|[kKmMbB])\b|(?!\w))"
@@ -71,10 +77,10 @@ STOPWORDS = {"whether", "will", "would", "could", "should", "what", "which", "wh
 
 
 # ----------------------------------------------------------------------------- extraction
-def numbers(text: str) -> List[Tuple[float, bool, str]]:
-    """(value, is_percent, matched text) for amounts and counts; dates, years and small integers excluded."""
-    for pattern, kind in DATE_PATTERNS[:-1]:
-        text = pattern.sub(lambda m: " " * len(m.group(0)), text)
+def number_spans(text: str) -> List[Tuple[int, int, float, bool, str]]:
+    """(start, end, value, is_percent, matched text) for amounts and counts; dates, years and small integers excluded."""
+    for pattern in [p for p, _ in DATE_PATTERNS[:-1]] + [DAY_MONTH]:
+        text = pattern.sub(lambda m: " " * len(m.group(0)), text)  # same length, so offsets stay valid
     found = []
     for match in NUMBER_RE.finditer(text):
         raw = match["num"]
@@ -87,11 +93,17 @@ def numbers(text: str) -> List[Tuple[float, bool, str]]:
             continue  # a year; handled by the date check
         if plain and value <= 10 and value.is_integer():
             continue
-        found.append((value, pct, match.group(0).strip()))
+        matched = match.group(0)
+        start = match.start() + len(matched) - len(matched.lstrip())
+        found.append((start, start + len(matched.strip()), value, pct, matched.strip()))
     return found
 
 
-def dates(text: str) -> List[Tuple[Tuple[int, Optional[int], Optional[int]], str]]:
+def numbers(text: str) -> List[Tuple[float, bool, str]]:
+    return [(value, pct, raw) for _, _, value, pct, raw in number_spans(text)]
+
+
+def date_spans(text: str) -> List[Tuple[int, int, Tuple[int, Optional[int], Optional[int]], str]]:
     found, taken = [], []
     for pattern, kind in DATE_PATTERNS:
         for match in pattern.finditer(text):
@@ -101,22 +113,36 @@ def dates(text: str) -> List[Tuple[Tuple[int, Optional[int], Optional[int]], str
             groups = match.groupdict()
             month = MONTHS[groups["m"].lower()] if groups.get("m") else (int(groups["mn"]) if groups.get("mn") else None)
             day = int(groups["d"]) if groups.get("d") else None
-            found.append(((int(groups["y"]), month, day), match.group(0)))
+            found.append((match.start(), match.end(), (int(groups["y"]), month, day), match.group(0)))
     return found
+
+
+def dates(text: str) -> List[Tuple[Tuple[int, Optional[int], Optional[int]], str]]:
+    return [(date, raw) for _, _, date, raw in date_spans(text)]
 
 
 # Markdown "#" headings and lines that are nothing but one bold span (the report agent's section titles).
 HEADING_LINE = re.compile(r"^\s*(?:#.*|\*\*[^*\n]+\*\*\s*)$", re.MULTILINE)
+ARTICLE = re.compile(r"^(?:The|A|An|This|That)\s+")
+HASHTAG_OR_MENTION = re.compile(r"[#@]\w+")
+
+
+def entity_spans(text: str) -> List[Tuple[int, int, str]]:
+    found, offset = [], 0
+    for line in text.splitlines(keepends=True):
+        if not HEADING_LINE.match(line):
+            for match in ENTITY_RE.finditer(line):
+                phrase = match.group(0).strip()
+                article = ARTICLE.match(phrase)
+                start = offset + match.start() + (article.end() if article else 0)
+                phrase = phrase[article.end():] if article else phrase
+                found.append((start, start + len(phrase), phrase))
+        offset += len(line)
+    return found
 
 
 def entities(text: str) -> List[str]:
-    found = []
-    for line in text.splitlines():
-        if HEADING_LINE.match(line):
-            continue
-        for match in ENTITY_RE.finditer(line):
-            found.append(re.sub(r"^(?:The|A|An|This|That)\s+", "", match.group(0).strip()))
-    return found
+    return [phrase for _, _, phrase in entity_spans(text)]
 
 
 def sentences(text: str) -> List[str]:
@@ -132,40 +158,120 @@ def _sentence_of(text: str, fragment: str) -> str:
 
 
 # ----------------------------------------------------------------------------- checks
+def _flag(flags: Dict[str, Dict], kind: str, text: str, raw: str, start: int, end: int, **extra) -> None:
+    """One flag per distinct value; 'spans' lists every unsupported occurrence (for the annotated report)."""
+    flag = flags.get(raw)
+    if flag is None:
+        flag = flags[raw] = {"type": kind, "value": raw, **extra, "sentence": _sentence_of(text, raw), "spans": []}
+    flag["spans"].append([start, end])
+
+
 def check_numbers(report: str, reference: str) -> List[Dict]:
     known = numbers(reference)
-    flags, seen = [], set()
-    for value, pct, raw in numbers(report):
-        ok = any(p == pct and abs(v - value) <= max(abs(v), 1e-9) * 0.01 for v, p, _ in known)
-        if not ok and raw not in seen:
-            seen.add(raw)
-            flags.append({"type": "UNSUPPORTED_NUMBER", "value": raw, "sentence": _sentence_of(report, raw)})
-    return flags
+    flags: Dict[str, Dict] = {}
+    for start, end, value, pct, raw in number_spans(report):
+        if not any(p == pct and abs(v - value) <= max(abs(v), 1e-9) * 0.01 for v, p, _ in known):
+            _flag(flags, "UNSUPPORTED_NUMBER", report, raw, start, end)
+    return list(flags.values())
 
 
 def check_dates(report: str, reference: str) -> List[Dict]:
     known = [d for d, _ in dates(reference)]
-    flags, seen = [], set()
-    for (year, month, day), raw in dates(report):
-        ok = any(y == year and (month is None or m == month) and (day is None or d == day) for y, m, d in known)
-        if not ok and raw not in seen:
-            seen.add(raw)
-            flags.append({"type": "UNSUPPORTED_DATE", "value": raw, "sentence": _sentence_of(report, raw)})
-    return flags
+    flags: Dict[str, Dict] = {}
+    for start, end, (year, month, day), raw in date_spans(report):
+        if not any(y == year and (month is None or m == month) and (day is None or d == day) for y, m, d in known):
+            _flag(flags, "UNSUPPORTED_DATE", report, raw, start, end)
+    return list(flags.values())
 
 
 def check_entities(report: str, reference: str) -> List[Dict]:
     vocabulary = {w.lower() for w in re.findall(r"[\w'’&-]+", reference)}
-    flags, seen = [], set()
-    for phrase in entities(report):
+    flags: Dict[str, Dict] = {}
+    for start, end, phrase in entity_spans(report):
         words = [w for w in re.findall(r"[\w'’&-]+", phrase) if w.lower() not in GENERIC_WORDS]
         missing = [w for w in words if w.lower() not in vocabulary
                    and re.sub(r"['’]s$", "", w.lower()) not in vocabulary]
-        if missing and phrase not in seen:
-            seen.add(phrase)
-            flags.append({"type": "UNSUPPORTED_ENTITY", "value": phrase, "missing_words": missing,
-                          "sentence": _sentence_of(report, phrase)})
+        if missing:
+            _flag(flags, "UNSUPPORTED_ENTITY", report, phrase, start, end, missing_words=missing)
+    return list(flags.values())
+
+
+def transcript_items(transcript: Dict) -> List[Dict]:
+    """Every post, quote and comment written during the simulation, with platform and author."""
+    names = {a.get("agent_id"): a.get("entity_name") for a in transcript.get("agents", [])}
+    items = []
+    for platform, data in sorted(transcript.get("platforms", {}).items()):
+        author = {u["user_id"]: names.get(u.get("agent_id")) or u.get("name") for u in data.get("users", [])}
+        for kind, key, rows in (("post", "post_id", data.get("posts", [])),
+                                ("comment", "comment_id", data.get("comments", []))):
+            for row in rows:
+                for field in ("content", "quote_content"):
+                    if row.get(field):
+                        items.append({"platform": platform, "kind": kind, "id": row.get(key),
+                                      "author": author.get(row.get("user_id")) or "unknown", "text": row[field]})
+    return items
+
+
+def check_transcript(transcript: Dict, reference: str) -> List[Dict]:
+    """Numbers, dates and names in the agents' own posts and comments that the seed does not support.
+
+    Agent names count as known (they come from the seed's graph); hashtags and @mentions are
+    ignored. Reposts repeat text, so each value is flagged once, at its first occurrence.
+    """
+    known = reference + "\n" + "\n".join(a.get("entity_name") or "" for a in transcript.get("agents", []))
+    flags, seen = [], set()
+    for item in transcript_items(transcript):
+        text = HASHTAG_OR_MENTION.sub(" ", item["text"])
+        for flag in check_numbers(text, known) + check_dates(text, known) + check_entities(text, known):
+            if (flag["type"], flag["value"]) in seen:
+                continue
+            seen.add((flag["type"], flag["value"]))
+            flag.pop("spans", None)
+            flags.append({**flag, "source": "transcript",
+                          "where": f"{item['platform']} {item['kind']} {item['id']} by {item['author']}"})
     return flags
+
+
+SENTENCE_END = re.compile(r"[.!?](?=[\s\"”')\]]|$)")
+
+
+def _sentence_end(text: str, sentence: str) -> Optional[int]:
+    words = sentence.split()[:8]
+    if len(words) < 3:
+        return None
+    match = re.search(r"\s+".join(re.escape(w) for w in words), text)
+    if not match:
+        return None
+    end = SENTENCE_END.search(text, match.end())
+    return end.end() if end else len(text)
+
+
+def annotate(report: str, flags: List[Dict], run_id: str) -> str:
+    """The report with **[FLAG]** after each flagged value, or after the flagged sentence."""
+    marks, unplaced = [], []
+    for flag in flags:
+        label = flag["type"] + (f" {flag['unknown']}" if flag.get("unknown") else "")
+        if flag.get("spans"):
+            marks += [(start, end, label) for start, end in flag["spans"]]
+            continue
+        position = _sentence_end(report, flag.get("sentence", ""))
+        if position is None:
+            unplaced.append(f"- **[{label}]** {flag.get('value') or ''}: {flag.get('sentence', '')}")
+        else:
+            marks.append((position, position, label))
+    accepted, covered_to = [], -1
+    for start, end, label in sorted(marks, key=lambda m: (m[0], m[0] - m[1])):
+        if start < covered_to and end > start:
+            continue  # overlaps an already marked value
+        accepted.append((end, label))
+        covered_to = max(covered_to, end)
+    text = report
+    for end, label in sorted(accepted, key=lambda m: m[0], reverse=True):
+        text = f"{text[:end]} **[{label}]**{text[end:]}"
+    header = (f"> factguard annotations for {run_id}: **[FLAG]** follows each item to check against the seed "
+              "(details in factguard.md). A flag means \"check this\", not \"this is false\".\n\n")
+    footer = "\n\n## factguard: flags not placed in the text\n\n" + "\n".join(unplaced) + "\n" if unplaced else "\n"
+    return header + text.rstrip("\n") + footer
 
 
 def agent_activity(transcript: Dict) -> Dict[str, int]:
@@ -274,18 +380,26 @@ def guard_run(run_id: str, llm: Optional[LocalLLM], runs_dir: Path = RUNS_DIR) -
     reference += "\n" + "\n".join(v["text"] for v in choices.values())
     flags = (check_numbers(report, reference) + check_dates(report, reference) + check_entities(report, reference)
              + check_actors(report, agent_activity(transcript)) + check_unknowns(report, unknowns, choices, llm))
-    counts: Dict[str, int] = {}
-    for flag in flags:
-        counts[flag["type"]] = counts.get(flag["type"], 0) + 1
-    result = {"run_id": run_id, "batch_id": info["batch_id"], "variant": choices, "counts": counts, "flags": flags,
-              "llm_judge": llm.model if llm else None}
+    flags = [dict(flag, source="report") for flag in flags]
+    transcript_flags = check_transcript(transcript, reference)
+
+    def count(items: List[Dict]) -> Dict[str, int]:
+        counts: Dict[str, int] = {}
+        for flag in items:
+            counts[flag["type"]] = counts.get(flag["type"], 0) + 1
+        return counts
+
+    result = {"run_id": run_id, "batch_id": info["batch_id"], "variant": choices, "counts": count(flags),
+              "transcript_counts": count(transcript_flags), "flags": flags, "transcript_flags": transcript_flags,
+              "transcript_items": len(transcript_items(transcript)), "llm_judge": llm.model if llm else None}
     write_private_json(run_dir / "factguard.json", result)
     write_private_text(run_dir / "factguard.md", format_result(result))
+    write_private_text(run_dir / "report.annotated.md", annotate(report, flags, run_id))
     return result
 
 
 def format_result(result: Dict) -> str:
-    lines = [f"# factguard: {result['run_id']}", ""]
+    lines = [f"# factguard: {result['run_id']}", "", "## Report (annotated copy: report.annotated.md)", ""]
     if not result["flags"]:
         lines.append("No flags.")
     for flag in result["flags"]:
@@ -295,6 +409,12 @@ def format_result(result: Dict) -> str:
             lines.append(f"  - {flag['detail']}")
         if flag.get("assumption") is not None or flag["type"].startswith("UNKNOWN"):
             lines.append(f"  - premise for this run: {flag.get('assumption') or 'none (left open)'}")
+    lines += ["", f"## Simulation transcript ({result.get('transcript_items', 0)} posts, quotes and comments)", ""]
+    transcript_flags = result.get("transcript_flags") or []
+    if not transcript_flags:
+        lines.append("No flags.")
+    for flag in transcript_flags:
+        lines.append(f"- **{flag['type']}** `{flag['value']}` ({flag['where']}): {flag['sentence']}")
     return "\n".join(lines) + "\n"
 
 
@@ -321,7 +441,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     for run_id in run_ids:
         result = guard_run(run_id, llm)
         summary = ", ".join(f"{k} {v}" for k, v in sorted(result["counts"].items())) or "no flags"
-        print(f"{run_id}: {summary}  -> ops/runs/{run_id}/factguard.md")
+        in_transcript = ", ".join(f"{k} {v}" for k, v in sorted(result["transcript_counts"].items())) or "no flags"
+        print(f"{run_id}: report {summary}; transcript {in_transcript}  -> ops/runs/{run_id}/factguard.md")
     return 0
 
 

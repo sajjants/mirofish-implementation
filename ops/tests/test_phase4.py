@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import copy
 import json
+import re
+import shutil
 import sqlite3
 import sys
 import tempfile
@@ -229,6 +231,25 @@ class PlanTests(unittest.TestCase):
                          ["rounds per run 30 -> 20", "runs per question 3 -> 2", "runs per question 2 -> 1",
                           "rounds per run 20 -> 30"])
         self.assertTrue(any("cannot be compared" in w for w in plan["warnings"]))
+
+    def test_small_and_large_inputs_respect_limits(self):
+        lim = limits()
+        small = planner.make_plan(lim, ["Q1"], unknown_count=0, agents=8)
+        large = planner.make_plan(lim, [f"Q{i}" for i in range(8)], unknown_count=5, agents=40)
+        self.assertNotEqual((small["runs_per_question"], small["rounds_per_run"]),
+                            (large["runs_per_question"], large["rounds_per_run"]))
+        for plan in (small, large):
+            self.assertTrue(plan["feasible"])
+            self.assertTrue(lim["rounds"]["real_min"] <= plan["rounds_per_run"] <= lim["rounds"]["hard_ceiling"])
+            self.assertLessEqual(plan["estimate"]["calls"], lim["caps"]["max_llm_calls"])
+            self.assertLessEqual(plan["estimate"]["minutes"], lim["caps"]["wall_clock_minutes"])
+            self.assertTrue(all(r["rounds"] == plan["rounds_per_run"] for r in plan["runs"]))
+        self.assertEqual((small["runs_per_question"], small["rounds_per_run"], small["cuts"]), (2, 30, []))
+        self.assertEqual((large["runs_per_question"], large["rounds_per_run"]), (2, 21))
+        kinds = [c.split(" (")[0] for c in large["cuts"]]
+        self.assertEqual(kinds, ["rounds per run 30 -> 20", "runs per question 3 -> 2", "rounds per run 20 -> 21"])
+        self.assertIn("budget freed", large["cuts"][-1])  # only freed budget may raise rounds after a run cut
+        self.assertTrue(any("40 agents exceeds" in w for w in large["warnings"]))
 
     def test_infeasible_plan_has_no_runs(self):
         plan = planner.make_plan(limits(caps__max_llm_calls=100), ["Q1"], unknown_count=0)
@@ -489,7 +510,8 @@ class BatchTests(unittest.TestCase):
         (root / "terms.txt").write_text("person: Elena Duarte\nplace: Riverton\n")
         self.root = root
         self.patches = [mock.patch.object(prepare_inputs, "RUNS_DIR", self.runs),
-                        mock.patch.object(prepare_inputs, "MAPPINGS_DIR", root / "mappings")]
+                        mock.patch.object(prepare_inputs, "MAPPINGS_DIR", root / "mappings"),
+                        mock.patch.object(run_batch, "env_values", lambda: {"MIROFISH_MEMORY_BACKEND": "local"})]
         for patch in self.patches:
             patch.start()
 
@@ -582,6 +604,64 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(sorted(state["runs"]), ["b1_pilot", "b1_q1_r1", "b1_q1_r2", "b1_q2_r1", "b1_q2_r2"])
         self.assertEqual(purge.batch_run_ids("b1", self.runs), sorted(state["runs"]))
 
+    def test_zep_cloud_backend_needs_a_pseudonymised_batch(self):
+        server = FakeMiroFish()
+        try:
+            for terms, allowed in ((False, False), (True, True)):
+                shutil.rmtree(self.runs / "b1", ignore_errors=True)
+                self.prepare(terms=terms)
+                batch = run_batch.Batch("b1", client=mirofish_api.MiroFishClient(server.url), log=lambda m: None,
+                                        limits_path=self.limits_path, runs_dir=self.runs, check_meter=False)
+                with mock.patch.object(run_batch, "env_values", lambda: {"MIROFISH_MEMORY_BACKEND": "zep"}):
+                    if allowed:
+                        batch.preflight()
+                    else:
+                        with self.assertRaisesRegex(run_batch.BatchError, "Zep Cloud"):
+                            batch.preflight()
+        finally:
+            server.close()
+
+    def test_killed_batch_resumes_without_repeating_finished_runs(self):
+        self.prepare()
+        unknown_variants.propose("b1", llm=FakeLLM([lambda p: {"alternatives": ["One.", "Two.", "Three."]}]))
+        server = FakeMiroFish()
+        prepared = []
+
+        def log(message):
+            if message.startswith("[prepare] done"):
+                prepared.append(message)
+                if len(prepared) == 2:  # b1_q1_r1 finishes; b1_q1_r2 is killed after its prepare stage
+                    raise KeyboardInterrupt
+
+        def make_batch(log_fn):
+            return run_batch.Batch("b1", client=mirofish_api.MiroFishClient(server.url), log=log_fn,
+                                   limits_path=self.limits_path, meter_path=self.root / "meter.jsonl",
+                                   runs_dir=self.runs, poll_interval_s=0.01, check_meter=False,
+                                   provenance_fn=lambda: {}, simulations_dir=self.sims)
+
+        rows = lambda path=None, start=0.0, end=None: [{"ts": start, "path": "/v1/chat/completions", "status": 200}]
+        try:
+            with mock.patch.object(run_batch, "read_meter", rows):
+                make_batch(lambda m: None).pilot()
+                with self.assertRaises(KeyboardInterrupt):
+                    make_batch(log).run()
+                state = json.loads((self.runs / "b1" / "batch.json").read_text())
+                self.assertEqual(state["runs"]["b1_q1_r1"]["status"], "done")
+                self.assertEqual(state["runs"]["b1_q1_r2"]["status"], "failed")
+                self.assertNotIn("b1_q2_r1", state["runs"])
+                before = server.count("/api/graph/ontology/generate")
+                resumed_log = []
+                make_batch(resumed_log.append).run()
+        finally:
+            server.close()
+        # resume: r1 skipped, r2 continues after its finished stages, the two Q2 runs start fresh
+        self.assertEqual(server.count("/api/graph/ontology/generate") - before, 2)
+        self.assertIn("b1_q1_r1: already done, skipping", resumed_log)
+        self.assertTrue(any(m.startswith("[prepare] already done") for m in resumed_log))
+        state = json.loads((self.runs / "b1" / "batch.json").read_text())
+        self.assertEqual({r: v["status"] for r, v in state["runs"].items()},
+                         {r: "done" for r in ("b1_pilot", "b1_q1_r1", "b1_q1_r2", "b1_q2_r1", "b1_q2_r2")})
+
     def test_summarize_calls_and_cost_model(self):
         rows = [{"path": "/v1/chat/completions", "status": 200, "tools": True, "tool_calls": 1, "tool_args_ok": True},
                 {"path": "/v1/chat/completions", "status": 200, "tools": True, "tool_calls": 0},
@@ -626,6 +706,30 @@ class FactGuardTests(unittest.TestCase):
         self.assertNotIn("Emergent Information Ecosystem", entities)
         self.assertIn("Northgate Freight Alliance", entities)
         self.assertNotIn("Emergent", " ".join(factguard.sentences(report)))
+
+    def test_transcript_posts_are_checked(self):
+        transcript = {"agents": [{"agent_id": 0, "entity_name": "Tomas Reyes"}], "platforms": {"reddit": {
+            "users": [{"user_id": 1, "agent_id": 0, "name": "treyes_1"}],
+            "posts": [{"post_id": 1, "user_id": 1, "quote_content": None,
+                       "content": "Maria Gonzalez says 2,400 people signed. #RivertonNeedsItsDepot Tomas Reyes agrees."}],
+            "comments": [{"comment_id": 4, "post_id": 1, "user_id": 1,
+                          "content": "Maria Gonzalez again: 2,400! Thanks @RivertonDaily, see you by 21 November."}]}}}
+        flags = factguard.check_transcript(transcript, REFERENCE)
+        values = [(f["type"], f["value"]) for f in flags]
+        self.assertEqual(values, [("UNSUPPORTED_NUMBER", "2,400"), ("UNSUPPORTED_ENTITY", "Maria Gonzalez")])
+        self.assertEqual(flags[0]["where"], "reddit post 1 by Tomas Reyes")
+        self.assertNotIn("spans", flags[0])
+
+    def test_annotated_report_marks_values_and_sentences(self):
+        flags = (factguard.check_numbers(self.REPORT, REFERENCE) + factguard.check_dates(self.REPORT, REFERENCE)
+                 + factguard.check_actors(self.REPORT, {"Elena Duarte": 0}))
+        text = factguard.annotate(self.REPORT, flags, "r1")
+        self.assertIn("2,400 **[UNSUPPORTED_NUMBER]**", text)
+        self.assertIn("5 May 2026 **[UNSUPPORTED_DATE]**", text)
+        self.assertIn("was unanimous. **[INACTIVE_ACTOR]**", text)
+        self.assertNotIn("30 percent **[", text)  # supported values are left alone
+        body = text.split("\n\n", 1)[1]
+        self.assertEqual(re.sub(r" \*\*\[[A-Z_0-9 ]+\]\*\*", "", body), self.REPORT)
 
     def test_inactive_actor(self):
         flags = factguard.check_actors(self.REPORT, {"Elena Duarte": 0, "Tomas Reyes": 3})
@@ -688,6 +792,17 @@ class CompareTests(unittest.TestCase):
         self.assertIn("anecdotes", warnings)
         self.assertIn("disagreed with itself on 1", warnings)
         self.assertIn("cannot be separated", warnings)
+        self.assertNotIn("mostly model noise", warnings)
+
+    def test_identical_seed_runs_that_disagree_are_called_noise(self):
+        def run(run_id, trajectory, rounds=30):
+            return {"run_id": run_id, "question": "Q1", "variant": {}, "rounds": rounds,
+                    "labels": [{"trajectory": trajectory, "resistors": []}]}
+        agreeing = compare.aggregate([run("a", "rejection"), run("b", "rejection"), run("p", "stalemate", 10)], [])
+        self.assertNotIn("model noise", " ".join(agreeing["Q1"]["warnings"]))
+        warnings = " ".join(compare.aggregate([run("a", "rejection"), run("b", "stalemate")], [])["Q1"]["warnings"])
+        self.assertIn("(a, b) ended differently (rejection, stalemate): results are mostly model noise", warnings)
+        self.assertNotIn("cannot be separated", warnings)
 
     def test_shipped_rubric_is_valid(self):
         self.assertGreaterEqual(len(compare.load_rubric()["trajectories"]), 2)
