@@ -50,6 +50,8 @@ ops/scripts/purge.sh B1 --batch                      # shred all runs of the bat
 
 Calls are measured by `scripts/llm_meter.py`, a loopback proxy that `start.sh` puts between MiroFish and Ollama when `LLM_BASE_URL` is `http://127.0.0.1:11435/v1`. It logs per-call metadata only (time, status, tokens, whether JSON or tool-call output parsed) to `logs/llm_meter.jsonl`, never prompt or answer text. Only one batch may run at a time, and nothing else should use MiroFish meanwhile, because calls are attributed to runs by time window.
 
+Upstream starts every simulated clock at 00:00 and lets agents act only in their generated active hours, so the first rounds of a run are empty night hours. `run_batch.py` therefore shifts each run's generated schedule (in the simulation's `simulation_config.json`, after prepare and before the rounds start) so round 1 is `simulation.clock_start_hour` in `limits.yaml` (08:00). No MiroFish code changes; agents never see the clock, only log timestamps read as if the day started at midnight. The planner costs rounds per expected agent turn, computed from the pilot's schedule (`scripts/sim_schedule.py --simulation SIM_ID` prints it).
+
 ## Layout
 
 | Path | Purpose |
@@ -83,6 +85,7 @@ Calls are measured by `scripts/llm_meter.py`, a loopback proxy that `start.sh` p
 | `scripts/unknown_variants.py` | Alternatives per UNKNOWN (local LLM) and seeded, balanced variants |
 | `scripts/plan.py` | Deterministic planner: cuts rounds first, then runs, and prints each cut |
 | `scripts/llm_meter.py` | Loopback metering proxy in front of Ollama (metadata only) |
+| `scripts/sim_schedule.py` | Shifts a prepared simulation's clock; exact expected agent turns per round count |
 | `scripts/run_batch.py` | Pilot, confirmation gate, planned runs, extended manifests, transcript export, resume |
 | `scripts/factguard.py` | Flags report claims not supported by the seed or the run's variant |
 | `scripts/compare.py` | Classifies runs against the rubric and summarises them with noise warnings |

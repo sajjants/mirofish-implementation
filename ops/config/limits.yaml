@@ -21,9 +21,19 @@ caps:
 # the rounds, so the backend reports round 0 forever (found in the Phase 4 pilot).
 platform: parallel
 
-# Used only until a pilot has measured the real values on this machine.
+simulation:
+  # Upstream starts every simulated clock at 00:00 and agents only act in their active hours, so
+  # without this the first ~8 rounds of every run are empty night hours. run_batch.py shifts each
+  # run's generated schedule so round 1 is this hour (see sim_schedule.py). 0 = upstream behaviour.
+  clock_start_hour: 8
+
+# Used only until a pilot has measured the real values on this machine. Once it has, round cost is
+# idle seconds per round plus a cost per expected agent turn, computed from the run's schedule.
 estimates:
   fixed_calls_per_run: 120      # ontology, graph extraction, personas, config, report
   calls_per_round: 12
   fixed_seconds_per_run: 1200
   seconds_per_round: 8
+  seconds_per_idle_round: 3     # a round with no agent turns
+  calls_per_agent_turn: 1.5     # used if the pilot had no agent turns to measure
+  seconds_per_agent_turn: 12

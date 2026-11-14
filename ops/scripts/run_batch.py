@@ -12,7 +12,9 @@ calls, time and structured-output failures are measured. Only one batch may run 
 
 Each run is a mirofish_api.RunPipeline under ops/runs/<RUN_ID>/ with a resumable manifest,
 extended with: upstream commit and patch hashes, ops commit, model name and digests, limits,
-seed/variant hashes, the variant mapping, per-stage timings and metered calls. After the report,
+seed/variant hashes, the variant mapping, per-stage timings and metered calls. Between prepare and
+the rounds, the generated schedule is shifted so the simulated day starts at limits'
+simulation.clock_start_hour (sim_schedule.py; upstream starts at 00:00). After the report,
 the simulation's posts, comments and agent stances are exported to transcript.json for
 factguard.py and compare.py. Re-running the same command resumes; finished runs are skipped.
 """
@@ -37,9 +39,12 @@ from mirofish_api import ApiError, MiroFishClient, RunPipeline, sha256_file, wri
 from opsconfig import (METER_LOG, OPS_DIR, RUNS_DIR, STATE_DIR, UPSTREAM_DIR, ensure_yaml, env_values,  # noqa: E402
                        git_info, make_private_dir, model_conf)
 from prepare_inputs import batch_dir, load_inputs  # noqa: E402
+from sim_schedule import apply_clock_shift, expected_turns  # noqa: E402
 from unknown_variants import DEFAULT_RNG_SEED, sample  # noqa: E402
 
 SIMULATIONS_DIR = UPSTREAM_DIR / "backend" / "uploads" / "simulations"
+PLATFORM_COUNT = {"parallel": 2}
+ALREADY_STARTED = ("starting", "running", "paused", "completed")
 ENV_KEYS_RECORDED = ("LLM_MODEL_NAME", "LLM_BASE_URL", "MIROFISH_MEMORY_BACKEND", "LOCAL_GRAPH_EMBED_MODEL",
                      "LOCAL_GRAPH_EMBED_URL", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE")
 ROUND_STAGE = "rounds"
@@ -114,16 +119,39 @@ def run_totals(per_stage: Dict[str, Dict], manifest: Dict, meter_path: Path = ME
             "wall_seconds": round(end - start, 1), **summarize_calls(read_meter(meter_path, start, end))}
 
 
-def cost_model_from_run(per_stage: Dict[str, Dict], rounds: int) -> Dict[str, float]:
+def cost_model_from_run(per_stage: Dict[str, Dict], rounds: int, schedule: Optional[Dict] = None,
+                        estimates: Optional[Dict[str, float]] = None, platforms: int = 2) -> Dict[str, Any]:
+    """Split the pilot's cost into fixed + per round + per expected agent turn.
+
+    With a schedule, the rounds stage is charged per expected agent turn (on top of idle seconds per
+    round), so plans for longer runs follow the agents' active hours instead of scaling linearly
+    from a pilot that may have covered quiet hours. Without one (or with no expected turns), the
+    rounds stage is linear per round and turns are costed from the estimates block.
+    """
     if ROUND_STAGE not in per_stage or rounds < 1:
         raise BatchError("the pilot has no measured rounds stage")
     fixed = {k: v for k, v in per_stage.items() if k != ROUND_STAGE}
-    return {
+    measured = per_stage[ROUND_STAGE]
+    model: Dict[str, Any] = {
         "fixed_calls": sum(v["calls"] for v in fixed.values()),
-        "calls_per_round": round(per_stage[ROUND_STAGE]["calls"] / rounds, 2),
+        "calls_per_round": round(measured["calls"] / rounds, 2),
         "fixed_seconds": round(sum(v["seconds"] for v in fixed.values()), 1),
-        "seconds_per_round": round(per_stage[ROUND_STAGE]["seconds"] / rounds, 2),
+        "seconds_per_round": round(measured["seconds"] / rounds, 2),
     }
+    if schedule is None:
+        return model
+    est = estimates or {}
+    turns = expected_turns(schedule, rounds, platforms)
+    model.update(schedule=schedule, platforms=platforms, pilot_expected_turns=turns)
+    if turns >= 1:
+        idle = float(est.get("seconds_per_idle_round", 0.0))
+        model.update(calls_per_round=0.0, seconds_per_round=idle,
+                     calls_per_turn=round(measured["calls"] / turns, 3),
+                     seconds_per_turn=round(max(0.0, measured["seconds"] - idle * rounds) / turns, 2))
+    else:
+        model.update(calls_per_turn=float(est.get("calls_per_agent_turn", 0.0)),
+                     seconds_per_turn=float(est.get("seconds_per_agent_turn", 0.0)))
+    return model
 
 
 # ----------------------------------------------------------------------------- provenance
@@ -248,6 +276,20 @@ class Batch:
         return (self.dir / question["requirement_file"]).read_text(encoding="utf-8")
 
     # ----- one run
+    def shift_clock(self, simulation_id: str, rounds: int) -> Dict:
+        """The 'schedule' stage: move the prepared simulation's clock to limits' clock_start_hour."""
+        start_hour = self.limits["simulation"]["clock_start_hour"]
+        status = self.client.get(f"/api/simulation/{simulation_id}/run-status").get("runner_status")
+        if status in ALREADY_STARTED:
+            self.log(f"schedule: simulation already {status}; its clock can no longer be shifted")
+            return {"clock_start_hour": None, "changed": False, "skipped": f"simulation already {status}"}
+        result = apply_clock_shift(simulation_id, start_hour, rounds,
+                                   PLATFORM_COUNT.get(self.limits["platform"], 1), self.simulations_dir)
+        self.log(f"schedule: clock starts at {start_hour:02d}:00 "
+                 f"({'shifted' if result['changed'] else 'unchanged'}); "
+                 f"expected agent turns in {rounds} rounds: {result['expected_agent_turns']:.0f}")
+        return result
+
     def execute(self, run_id: str, question_id: str, variant: Dict, rounds: int, kind: str) -> Dict:
         seed_file = self.dir / variant["seed_file"]
         record = self.state["runs"].setdefault(run_id, {"question": question_id, "variant": variant["index"],
@@ -275,7 +317,8 @@ class Batch:
         try:
             manifest = pipeline.run([seed_file], self.requirement(question_id), max_rounds=rounds,
                                     platform=self.limits["platform"], max_agents=self.limits["caps"]["max_agents"],
-                                    project_name=run_id)
+                                    project_name=run_id,
+                                    before_rounds=lambda simulation_id: self.shift_clock(simulation_id, rounds))
         except BaseException as exc:
             record.update(status="failed", error=str(exc)[:500])
             self._save_state()
@@ -307,10 +350,12 @@ class Batch:
         manifest = json.loads((self.runs_dir / run_id / "manifest.json").read_text(encoding="utf-8"))
         metrics = manifest["batch"]["metrics"]
         measured_rounds = metrics.get("rounds_completed") or rounds
+        schedule = ((manifest["stages"].get("schedule") or {}).get("result") or {}).get("schedule")
         pilot = {
             "run_id": run_id, "question": first, "rounds": measured_rounds, "agents": metrics["agents"],
             "total": metrics["total"], "stages": metrics["stages"],
-            "cost_model": cost_model_from_run(metrics["stages"], measured_rounds),
+            "cost_model": cost_model_from_run(metrics["stages"], measured_rounds, schedule, self.limits["estimates"],
+                                              PLATFORM_COUNT.get(self.limits["platform"], 1)),
             "measured_at": time.time(),
         }
         write_private_json(self.dir / "pilot.json", pilot)
@@ -340,8 +385,8 @@ class Batch:
         self.log(planner.format_plan(plan))
         variants = self.variants()
         caps = self.limits["caps"]
-        per_run_calls = plan["cost_model"]["fixed_calls"] + plan["cost_model"]["calls_per_round"] * plan["rounds_per_run"]
-        per_run_seconds = plan["cost_model"]["fixed_seconds"] + plan["cost_model"]["seconds_per_round"] * plan["rounds_per_run"]
+        per_run = planner.run_cost(plan["cost_model"], plan["rounds_per_run"])
+        per_run_calls, per_run_seconds = per_run["calls"], per_run["seconds"]
         results = []
         for spec in plan["runs"]:
             done = [r for r in self.state["runs"].values() if r.get("kind") == "real" and r.get("status") == "done"]
@@ -364,12 +409,21 @@ class Batch:
 def format_pilot(pilot: Dict, plan: Dict) -> str:
     total, model = pilot["total"], pilot["cost_model"]
     rate = total["structured_failure_rate"]
+    rounds_stage = pilot["stages"].get(ROUND_STAGE, {})
+    if model.get("pilot_expected_turns", 0) >= 1:
+        cost_line = (f"  LLM calls: {total['calls']} (fixed {model['fixed_calls']:.0f} + rounds {rounds_stage.get('calls')} "
+                     f"for {model['pilot_expected_turns']:.0f} expected agent turns = "
+                     f"{model['calls_per_turn']:.2f} per turn)")
+        time_line = (f"  time: {total['wall_seconds'] / 60:.1f} min wall clock (fixed {model['fixed_seconds'] / 60:.1f} min "
+                     f"+ {model['seconds_per_round']:.0f} s per round + {model['seconds_per_turn']:.1f} s per agent turn)")
+    else:
+        cost_line = f"  LLM calls: {total['calls']} (fixed {model['fixed_calls']:.0f} + {model['calls_per_round']} per round)"
+        time_line = (f"  time: {total['wall_seconds'] / 60:.1f} min wall clock "
+                     f"(fixed {model['fixed_seconds'] / 60:.1f} min + {model['seconds_per_round']} s per round)")
     lines = [
         f"PILOT {pilot['run_id']}: {pilot['rounds']} rounds, {pilot['agents']} agents",
-        f"  LLM calls: {total['calls']} (fixed {model['fixed_calls']:.0f} + {model['calls_per_round']} per round); "
-        f"HTTP errors {total['http_errors']}; truncated answers {total['truncated']}",
-        f"  time: {total['wall_seconds'] / 60:.1f} min wall clock "
-        f"(fixed {model['fixed_seconds'] / 60:.1f} min + {model['seconds_per_round']} s per round)",
+        f"{cost_line}; HTTP errors {total['http_errors']}; truncated answers {total['truncated']}",
+        time_line,
         f"  structured-output failure rate: {'n/a' if rate is None else f'{rate:.1%}'} "
         f"({total['json_parse_failures']} of {total['json_mode_calls']} JSON-mode answers unparseable, "
         f"{total['tool_argument_failures']} malformed tool calls); agents took no action in "

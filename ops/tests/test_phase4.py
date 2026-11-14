@@ -34,6 +34,7 @@ import pseudonymize  # noqa: E402
 import purge  # noqa: E402
 import run_batch  # noqa: E402
 import seedfile  # noqa: E402
+import sim_schedule  # noqa: E402
 import unknown_variants  # noqa: E402
 from local_llm import LLMError  # noqa: E402
 from test_phase3 import FakeMiroFish  # noqa: E402
@@ -48,8 +49,26 @@ RAW_LIMITS = {
     "runs": {"per_question": 2, "per_question_high_unknown": 3, "unknown_threshold": 2},
     "caps": {"max_llm_calls": 6000, "wall_clock_minutes": 600, "max_agents": 30},
     "platform": "parallel",
+    "simulation": {"clock_start_hour": 8},
     "estimates": {"fixed_calls_per_run": 120, "calls_per_round": 12, "fixed_seconds_per_run": 1200,
-                  "seconds_per_round": 8},
+                  "seconds_per_round": 8, "seconds_per_idle_round": 3, "calls_per_agent_turn": 1.5,
+                  "seconds_per_agent_turn": 12},
+}
+
+
+# Shaped like the Phase 4 pilot's generated config: day agents, evening agents, a night clock start.
+SCHEDULE_CONFIG = {
+    "time_config": {"total_simulation_hours": 72, "minutes_per_round": 60, "agents_per_hour_min": 3,
+                    "agents_per_hour_max": 5, "peak_hours": [19, 20, 21, 22], "peak_activity_multiplier": 1.5,
+                    "off_peak_hours": [0, 1, 2, 3, 4, 5], "off_peak_activity_multiplier": 0.05,
+                    "work_hours": list(range(9, 19))},
+    "agent_configs": [
+        {"agent_id": 0, "active_hours": list(range(9, 17)), "activity_level": 0.4},
+        {"agent_id": 1, "active_hours": list(range(18, 23)), "activity_level": 0.8},
+        {"agent_id": 2, "active_hours": list(range(18, 23)), "activity_level": 0.6},
+        {"agent_id": 3, "active_hours": list(range(8, 23)), "activity_level": 0.5},
+        {"agent_id": 4},
+    ],
 }
 
 
@@ -227,7 +246,8 @@ class PlanTests(unittest.TestCase):
     def test_limits_validation(self):
         for section, key, value in (("rounds", "real_min", 35), ("rounds", "hard_ceiling", 41),
                                     ("caps", "max_llm_calls", 0), ("runs", "per_question", True),
-                                    ("platform", None, "mastodon"), ("platform", None, "reddit")):
+                                    ("platform", None, "mastodon"), ("platform", None, "reddit"),
+                                    ("simulation", "clock_start_hour", 24), ("simulation", "clock_start_hour", "8")):
             raw = copy.deepcopy(RAW_LIMITS)
             if key is None:
                 raw[section] = value
@@ -240,6 +260,97 @@ class PlanTests(unittest.TestCase):
         loaded = planner.load_limits()
         self.assertLessEqual(loaded["rounds"]["hard_ceiling"], 40)
         self.assertEqual(loaded["rounds"]["pilot"], 10)
+        self.assertEqual(loaded["simulation"]["clock_start_hour"], 8)
+
+    def test_measured_schedule_costs_per_agent_turn(self):
+        schedule = sim_schedule.schedule_of(sim_schedule.shift_config(SCHEDULE_CONFIG, 8))
+        measured = {"fixed_calls": 50, "calls_per_round": 0, "fixed_seconds": 300, "seconds_per_round": 3,
+                    "calls_per_turn": 1.25, "seconds_per_turn": 10, "schedule": schedule, "platforms": 2}
+        plan = planner.make_plan(limits(), ["Q1"], unknown_count=0, measured=measured)
+        turns = sim_schedule.expected_turns(schedule, 30)
+        self.assertEqual(plan["expected_agent_turns_per_run"], turns)
+        self.assertEqual(plan["estimate"]["calls"], round(2 * (50 + 1.25 * turns)))
+        self.assertEqual(plan["estimate"]["minutes"], round(2 * (300 + 3 * 30 + 10 * turns) / 60, 1))
+        self.assertIn("clock starts at 08:00", planner.format_plan(plan))
+
+
+def upstream_active_count(config, hour, rng):
+    """Re-statement of upstream get_active_agents_for_round() (pinned commit), returning len(selected)."""
+    tc = config.get("time_config", {})
+    if hour in tc.get("peak_hours", [9, 10, 11, 14, 15, 20, 21, 22]):
+        multiplier = tc.get("peak_activity_multiplier", 1.5)
+    elif hour in tc.get("off_peak_hours", [0, 1, 2, 3, 4, 5]):
+        multiplier = tc.get("off_peak_activity_multiplier", 0.3)
+    else:
+        multiplier = 1.0
+    target = int(rng.uniform(tc.get("agents_per_hour_min", 5), tc.get("agents_per_hour_max", 20)) * multiplier)
+    candidates = [a for a in config["agent_configs"]
+                  if hour in a.get("active_hours", list(range(8, 23))) and rng.random() < a.get("activity_level", 0.5)]
+    return min(target, len(candidates))
+
+
+class ScheduleTests(unittest.TestCase):
+    def test_shift_moves_every_hour_list_once(self):
+        shifted = sim_schedule.shift_config(SCHEDULE_CONFIG, 8)
+        tc = shifted["time_config"]
+        self.assertEqual(tc["peak_hours"], [11, 12, 13, 14])
+        self.assertEqual(tc["off_peak_hours"], [16, 17, 18, 19, 20, 21])
+        self.assertEqual(tc["work_hours"], list(range(1, 11)))
+        self.assertEqual(shifted["agent_configs"][0]["active_hours"], list(range(1, 9)))
+        self.assertEqual(shifted["agent_configs"][4]["active_hours"], list(range(0, 15)))  # upstream default 8-22
+        self.assertEqual(shifted[sim_schedule.CLOCK_MARKER], 8)
+        self.assertEqual(SCHEDULE_CONFIG["agent_configs"][0]["active_hours"], list(range(9, 17)))  # input untouched
+        self.assertEqual(sim_schedule.shift_config(shifted, 8), shifted)  # idempotent
+        with self.assertRaises(ValueError):
+            sim_schedule.shift_config(shifted, 6)
+        self.assertEqual(sim_schedule.shift_config(SCHEDULE_CONFIG, 0), SCHEDULE_CONFIG)
+
+    def test_expected_turns_match_upstream_selection(self):
+        import random
+        rng = random.Random(7)
+        for start in (0, 8):
+            config = sim_schedule.shift_config(SCHEDULE_CONFIG, start)
+            schedule = sim_schedule.schedule_of(config)
+            per_round = sim_schedule.expected_turns_per_round(schedule, 30)
+            for index in (0, 3, 10, 14, 20):
+                trials = 6000
+                mean = sum(upstream_active_count(config, index % 24, rng) for _ in range(trials)) / trials
+                self.assertAlmostEqual(per_round[index], mean, delta=0.08, msg=f"start {start} round {index + 1}")
+        night = sim_schedule.expected_turns(sim_schedule.schedule_of(SCHEDULE_CONFIG), 10)
+        day = sim_schedule.expected_turns(sim_schedule.schedule_of(sim_schedule.shift_config(SCHEDULE_CONFIG, 8)), 10)
+        self.assertLess(night, day / 3)
+
+    def test_apply_clock_shift_rewrites_once_and_keeps_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp, "sim_abc123", "simulation_config.json")
+            path.parent.mkdir()
+            path.write_text(json.dumps(SCHEDULE_CONFIG))
+            path.chmod(0o640)
+            first = sim_schedule.apply_clock_shift("sim_abc123", 8, 30, simulations_dir=Path(tmp))
+            self.assertTrue(first["changed"])
+            self.assertEqual(path.stat().st_mode & 0o777, 0o640)
+            self.assertEqual(json.loads(path.read_text())[sim_schedule.CLOCK_MARKER], 8)
+            second = sim_schedule.apply_clock_shift("sim_abc123", 8, 30, simulations_dir=Path(tmp))
+            self.assertFalse(second["changed"])
+            self.assertEqual(second["config_sha256_before"], first["config_sha256_after"])
+            self.assertEqual(second["expected_agent_turns"], first["expected_agent_turns"])
+            self.assertEqual(sorted(p.name for p in path.parent.iterdir()), ["simulation_config.json"])
+            for bad in ("../sim_abc123", "sim_abc/../x", "proj_1"):
+                with self.assertRaises(ValueError):
+                    sim_schedule.apply_clock_shift(bad, 8, 30, simulations_dir=Path(tmp))
+
+    def test_cost_model_from_pilot_schedule(self):
+        schedule = sim_schedule.schedule_of(sim_schedule.shift_config(SCHEDULE_CONFIG, 8))
+        stages = {"prepare": {"calls": 10, "seconds": 100}, "rounds": {"calls": 40, "seconds": 330}}
+        model = run_batch.cost_model_from_run(stages, 10, schedule, limits()["estimates"])
+        turns = sim_schedule.expected_turns(schedule, 10)
+        self.assertEqual(model["pilot_expected_turns"], turns)
+        self.assertEqual(model["calls_per_round"], 0.0)
+        self.assertEqual(model["calls_per_turn"], round(40 / turns, 3))
+        self.assertEqual(model["seconds_per_turn"], round((330 - 3 * 10) / turns, 2))
+        quiet = {**schedule, "agents": []}
+        fallback = run_batch.cost_model_from_run(stages, 10, quiet, limits()["estimates"])
+        self.assertEqual((fallback["calls_per_round"], fallback["calls_per_turn"]), (4.0, 1.5))
 
 
 class VariantTests(unittest.TestCase):
@@ -440,7 +551,11 @@ class BatchTests(unittest.TestCase):
                     batch.run()  # no pilot yet
                 pilot = batch.pilot()
                 self.assertEqual(pilot["agents"], 12)
-                self.assertEqual(pilot["cost_model"]["calls_per_round"], 0.2)
+                self.assertEqual(pilot["cost_model"]["calls_per_round"], 0.0)
+                self.assertGreater(pilot["cost_model"]["calls_per_turn"], 0)
+                sim_config = json.loads((self.sims / "sim_1" / "simulation_config.json").read_text())
+                self.assertEqual(sim_config[sim_schedule.CLOCK_MARKER], 8)
+                self.assertEqual(sim_config["agent_configs"][0]["active_hours"], list(range(0, 15)))
                 self.assertEqual(pilot["total"]["structured_failure_rate"], 0.5)
                 results = batch.run()
                 self.assertEqual(len(results), 4)
@@ -455,6 +570,10 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(info["provenance"]["model"]["gguf_sha256"], "abc")
         self.assertEqual(set(info["variant"]["choices"]), {"U1", "U2"})
         self.assertIn("rounds", info["metrics"]["stages"])
+        # the fake server reuses one simulation, so later runs find it started and leave the clock alone
+        self.assertIn("skipped", manifest["stages"]["schedule"]["result"])
+        pilot_manifest = json.loads((self.runs / "b1_pilot" / "manifest.json").read_text())
+        self.assertTrue(pilot_manifest["stages"]["schedule"]["result"]["changed"])
         uploads = [raw for _, p, raw in server.calls if p == "/api/graph/ontology/generate"]
         self.assertTrue(all(b"SCENARIO ASSUMPTION [U1]" in raw for raw in uploads))
         transcript = json.loads((self.runs / "b1_q1_r2" / "transcript.json").read_text())

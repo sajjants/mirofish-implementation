@@ -9,8 +9,9 @@ Rules (ops/config/limits.yaml): real runs use rounds.real_max rounds; each quest
 runs.per_question runs, or runs.per_question_high_unknown when the seed has more than
 runs.unknown_threshold UNKNOWN facts. If the estimate exceeds caps.max_llm_calls or
 caps.wall_clock_minutes, rounds are cut first (down to rounds.real_min), then runs; every cut
-is printed. Cost per run = fixed + per_round * rounds, from the pilot if measured, else from
-the estimates block.
+is printed. Cost per run = fixed + per_round * rounds + per_turn * expected agent turns, where the
+expected turns come from the pilot's agent schedule (sim_schedule.py) at the planned round count.
+Without a pilot, the estimates block's linear per-round cost is used.
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ from typing import Any, Dict, List, Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from mirofish_api import PLATFORMS  # noqa: E402
 from opsconfig import OPS_DIR, RUNS_DIR, ensure_yaml, load_yaml  # noqa: E402
+from sim_schedule import expected_turns, validate_start_hour  # noqa: E402
 
 DEFAULT_LIMITS = OPS_DIR / "config" / "limits.yaml"
 
@@ -49,8 +51,10 @@ def validate_limits(raw: Dict[str, Any]) -> Dict[str, Any]:
         "runs": {k: _positive_int(runs, k, "runs") for k in ("per_question", "per_question_high_unknown")},
         "caps": {k: _positive_int(caps, k, "caps") for k in ("max_llm_calls", "wall_clock_minutes", "max_agents")},
         "estimates": {k: _positive_number(est, k, "estimates")
-                      for k in ("fixed_calls_per_run", "calls_per_round", "fixed_seconds_per_run", "seconds_per_round")},
+                      for k in ("fixed_calls_per_run", "calls_per_round", "fixed_seconds_per_run", "seconds_per_round",
+                                "seconds_per_idle_round", "calls_per_agent_turn", "seconds_per_agent_turn")},
         "platform": raw.get("platform", "parallel"),
+        "simulation": {"clock_start_hour": validate_start_hour((raw.get("simulation") or {}).get("clock_start_hour", 0))},
     }
     threshold = runs.get("unknown_threshold")
     if isinstance(threshold, bool) or not isinstance(threshold, int) or threshold < 0:
@@ -73,11 +77,31 @@ def load_limits(path: Path = DEFAULT_LIMITS) -> Dict[str, Any]:
 
 def cost_model(limits: Dict[str, Any], measured: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     if measured:
-        return {"source": "pilot", **{k: float(measured[k]) for k in
-                                      ("fixed_calls", "calls_per_round", "fixed_seconds", "seconds_per_round")}}
+        model = {"source": "pilot", **{k: float(measured[k]) for k in
+                                       ("fixed_calls", "calls_per_round", "fixed_seconds", "seconds_per_round")}}
+        model.update({k: float(measured.get(k, 0.0)) for k in ("calls_per_turn", "seconds_per_turn")})
+        model["schedule"] = measured.get("schedule")
+        model["platforms"] = int(measured.get("platforms", 2))
+        return model
     est = limits["estimates"]
     return {"source": "estimates", "fixed_calls": est["fixed_calls_per_run"], "calls_per_round": est["calls_per_round"],
-            "fixed_seconds": est["fixed_seconds_per_run"], "seconds_per_round": est["seconds_per_round"]}
+            "fixed_seconds": est["fixed_seconds_per_run"], "seconds_per_round": est["seconds_per_round"],
+            "calls_per_turn": 0.0, "seconds_per_turn": 0.0, "schedule": None, "platforms": 2}
+
+
+def run_turns(model: Dict[str, Any], rounds: int) -> Optional[float]:
+    """Expected agent turns in one run of this many rounds, or None without a measured schedule."""
+    if not model.get("schedule"):
+        return None
+    return expected_turns(model["schedule"], rounds, model.get("platforms", 2))
+
+
+def run_cost(model: Dict[str, Any], rounds: int) -> Dict[str, float]:
+    """Estimated LLM calls and seconds for one run of this many rounds."""
+    turns = run_turns(model, rounds) or 0.0
+    return {"calls": model["fixed_calls"] + model["calls_per_round"] * rounds + model.get("calls_per_turn", 0) * turns,
+            "seconds": model["fixed_seconds"] + model["seconds_per_round"] * rounds
+            + model.get("seconds_per_turn", 0) * turns}
 
 
 def make_plan(limits: Dict[str, Any], question_ids: List[str], unknown_count: int,
@@ -90,10 +114,9 @@ def make_plan(limits: Dict[str, Any], question_ids: List[str], unknown_count: in
     n_questions = len(question_ids)
 
     def totals(rounds: int, runs: int) -> Dict[str, float]:
-        per_run_calls = model["fixed_calls"] + model["calls_per_round"] * rounds
-        per_run_seconds = model["fixed_seconds"] + model["seconds_per_round"] * rounds
-        return {"calls": round(n_questions * runs * per_run_calls),
-                "minutes": round(n_questions * runs * per_run_seconds / 60, 1)}
+        per_run = run_cost(model, rounds)
+        return {"calls": round(n_questions * runs * per_run["calls"]),
+                "minutes": round(n_questions * runs * per_run["seconds"] / 60, 1)}
 
     def fits(rounds: int, runs: int) -> bool:
         t = totals(rounds, runs)
@@ -153,6 +176,8 @@ def make_plan(limits: Dict[str, Any], question_ids: List[str], unknown_count: in
         "runs_per_question": runs,
         "rounds_per_run": rounds,
         "variants_needed": runs,
+        "clock_start_hour": limits["simulation"]["clock_start_hour"],
+        "expected_agent_turns_per_run": run_turns(model, rounds),
         "estimate": totals(rounds, runs),
         "caps": dict(caps),
         "cost_model": model,
@@ -171,6 +196,9 @@ def format_plan(plan: Dict[str, Any]) -> str:
         f"cost from {plan['cost_model']['source']})",
         f"  UNKNOWN facts: {plan['unknown_count']}; agents: {plan['agents'] if plan['agents'] is not None else 'not measured'}",
     ]
+    turns = plan.get("expected_agent_turns_per_run")
+    lines.append(f"  simulated clock starts at {plan.get('clock_start_hour', 0):02d}:00; expected agent turns per run: "
+                 + (f"{turns:.0f} (from the pilot's schedule)" if turns is not None else "not measured"))
     lines += [f"  CUT: {c}" for c in plan["cuts"]]
     lines += [f"  WARNING: {w}" for w in plan["warnings"]]
     return "\n".join(lines)

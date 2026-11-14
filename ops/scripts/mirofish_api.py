@@ -185,7 +185,7 @@ def rounds_done(state: Dict[str, Any], platform: str) -> bool:
 class RunPipeline:
     """One MiroFish run with a resumable manifest in ops/runs/<RUN_ID>/."""
 
-    STAGES = ("ontology", "graph", "simulation", "prepare", "rounds", "close_env", "report")
+    STAGES = ("ontology", "graph", "simulation", "prepare", "schedule", "rounds", "close_env", "report")
 
     def __init__(self, client: MiroFishClient, run_id: str, runs_dir: Path = RUNS_DIR,
                  log: Callable[[str], None] = print, poll_interval_s: float = 5.0):
@@ -226,7 +226,9 @@ class RunPipeline:
             max_agents: Optional[int] = None, entity_types: Optional[List[str]] = None,
             enable_graph_memory_update: bool = False, project_name: Optional[str] = None,
             stage_timeout_s: float = 4 * 3600, until: Optional[str] = None,
-            stall_timeout_s: float = 1800) -> Dict[str, Any]:
+            stall_timeout_s: float = 1800,
+            before_rounds: Optional[Callable[[str], Dict[str, Any]]] = None) -> Dict[str, Any]:
+        """before_rounds(simulation_id), if given, runs once as the 'schedule' stage after prepare."""
         if platform not in PLATFORMS:
             raise ValueError(f"platform must be one of {PLATFORMS}: upstream's single-platform scripts never "
                              "report the end of the rounds, so the run would wait forever")
@@ -301,6 +303,8 @@ class RunPipeline:
         self._stage("prepare", prepare)
         if until == "prepare":
             return self.manifest
+        if before_rounds is not None:
+            self._stage("schedule", lambda: before_rounds(simulation_id))
 
         def rounds():
             status_path = f"/api/simulation/{simulation_id}/run-status"
