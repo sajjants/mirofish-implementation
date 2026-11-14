@@ -150,7 +150,7 @@ From reading the code. These will be **confirmed empirically by `netcheck.sh` in
 
 1. Fetch them once in a supervised setup step: the Twitter model into a dedicated `HF_HOME`, and the tiktoken files into `TIKTOKEN_CACHE_DIR`.
 2. Then set `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1`.
-3. Alternatively, run Reddit-only (`platform=reddit`), which loads no Hugging Face model at all.
+3. Alternatively, run Reddit-only (`platform=reddit`), which loads no Hugging Face model at all. (Superseded: Reddit-only runs never report completion to the backend, see `NOTES.md` §11; the wrapper uses `parallel` with the cached model.)
 
 After that, `ops/config/allowed_hosts.txt` stays **empty** and `netcheck.sh` must see loopback connections only.
 

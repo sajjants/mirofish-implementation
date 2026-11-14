@@ -3,7 +3,9 @@
 # Usage: ops/scripts/start.sh [--no-frontend] [--netaudit FILE]
 #   --netaudit FILE   log every Python-level connect/DNS lookup of the backend and its
 #                     simulation subprocesses to FILE (JSON lines; used by netcheck.sh)
-# PIDs go to ops/state/{backend,frontend}.pid, console output to ops/logs/. Stop with stop.sh.
+# When LLM_BASE_URL points at 127.0.0.1:$LLM_METER_PORT, the metering proxy (llm_meter.py) is
+# started in front of Ollama; it logs per-call metadata (no content) to ops/logs/llm_meter.jsonl.
+# PIDs go to ops/state/{backend,frontend,meter}.pid, console output to ops/logs/. Stop with stop.sh.
 set -euo pipefail
 
 OPS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -39,13 +41,14 @@ fail() {
 env_get() { python3 "$OPS_DIR/scripts/envfile.py" get "$ENV_FILE" "$1" 2>/dev/null || true; }
 is_loopback() { [[ "$1" == "127.0.0.1" || "$1" == "localhost" || "$1" == "::1" ]]; }
 url_host() { python3 -c 'import sys, urllib.parse; print(urllib.parse.urlparse(sys.argv[1]).hostname or "")' "$1"; }
+url_port() { python3 -c 'import sys, urllib.parse; print(urllib.parse.urlparse(sys.argv[1]).port or "")' "$1"; }
 alive() { [[ -f "$1" ]] && kill -0 "$(cat "$1")" 2>/dev/null; }
 listeners() { lsof -nP -a -p "$1" -iTCP -sTCP:LISTEN -Fn 2>/dev/null | sed -n 's/^n//p' | sort -u; }
 port_in_use() { lsof -nP -t -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1; }
 
 command -v lsof >/dev/null 2>&1 || fail "lsof is required to verify the listening addresses"
 [[ -x "$PYTHON" && -f "$ENV_FILE" ]] || fail "run ops/scripts/bootstrap.sh first"
-for pidfile in "$STATE/backend.pid" "$STATE/frontend.pid"; do
+for pidfile in "$STATE/backend.pid" "$STATE/frontend.pid" "$STATE/meter.pid"; do
     alive "$pidfile" && fail "already running ($pidfile); run ops/scripts/stop.sh first"
 done
 
@@ -56,6 +59,7 @@ is_loopback "$FLASK_HOST" || fail "FLASK_HOST in $ENV_FILE must be 127.0.0.1 (go
 [[ "$(env_get FLASK_DEBUG | tr '[:upper:]' '[:lower:]')" != "true" ]] || fail "FLASK_DEBUG must be False"
 llm_url="$(env_get LLM_BASE_URL)"
 [[ -n "$llm_url" ]] || fail "LLM_BASE_URL is empty in $ENV_FILE (upstream would fall back to api.openai.com)"
+METER_PORT="${LLM_METER_PORT:-11435}"  # from model.conf; read before the environment scrub below
 for key in LLM_BASE_URL LLM_BOOST_BASE_URL LOCAL_GRAPH_EMBED_URL; do
     value="$(env_get "$key")"
     [[ -z "$value" ]] || is_loopback "$(url_host "$value")" || fail "$key in $ENV_FILE is not a loopback URL"
@@ -96,6 +100,14 @@ make_private_dir "$LOGS"
 make_private_dir "$UPSTREAM/backend/uploads"
 make_private_dir "$UPSTREAM/backend/logs"
 
+WITH_METER=0
+if [[ "$(url_port "$llm_url")" == "$METER_PORT" ]]; then
+    WITH_METER=1
+    port_in_use "$METER_PORT" && fail "port $METER_PORT (LLM meter) is already in use"
+else
+    echo "WARN: LLM_BASE_URL does not use the meter port $METER_PORT; LLM calls are not measured" \
+         "and run_batch.py will refuse to run (set LLM_BASE_URL=http://127.0.0.1:$METER_PORT/v1)" >&2
+fi
 port_in_use "$FLASK_PORT" && fail "port $FLASK_PORT is already in use"
 [[ "$WITH_FRONTEND" -eq 0 ]] || ! port_in_use "$FRONTEND_PORT" || fail "port $FRONTEND_PORT is already in use"
 
@@ -136,6 +148,13 @@ check_listeners() {
 }
 
 STARTED=1
+if [[ "$WITH_METER" -eq 1 ]]; then
+    python3 "$OPS_DIR/scripts/llm_meter.py" --listen "127.0.0.1:$METER_PORT" --upstream "$OLLAMA_HOST" \
+        --log "$LOGS/llm_meter.jsonl" </dev/null >>"$LOGS/llm_meter.log" 2>&1 &
+    echo $! >"$STATE/meter.pid"
+    wait_http "http://127.0.0.1:$METER_PORT/meter/health" "$STATE/meter.pid" llm_meter
+    check_listeners "$(cat "$STATE/meter.pid")" llm_meter
+fi
 (cd "$UPSTREAM/backend" && exec "$PYTHON" run.py) </dev/null >>"$LOGS/backend.log" 2>&1 &
 echo $! >"$STATE/backend.pid"
 wait_http "http://127.0.0.1:$FLASK_PORT/health" "$STATE/backend.pid" backend

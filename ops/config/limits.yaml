@@ -1,0 +1,29 @@
+# Limits for ops/scripts/plan.py and run_batch.py. All numbers are per batch unless noted.
+# The planner is deterministic: the same limits, inputs and pilot measurements give the same plan.
+
+rounds:
+  pilot: 10            # the single pilot run on Q1
+  real_min: 20         # real runs never go below this; the planner cuts runs instead
+  real_max: 30         # preferred length of a real run
+  hard_ceiling: 40     # absolute maximum, also enforced by mirofish_api.py
+
+runs:
+  per_question: 2
+  per_question_high_unknown: 3
+  unknown_threshold: 2 # more UNKNOWN facts than this -> per_question_high_unknown runs
+
+caps:
+  max_llm_calls: 6000       # MiroFish LLM calls across all real runs (measured by llm_meter.py)
+  wall_clock_minutes: 600   # total time for all real runs
+  max_agents: 30            # warn above this; agents = typed entities in the graph (upstream has no cap)
+
+# Only 'parallel' (Twitter + Reddit) works: upstream's single-platform scripts never log the end of
+# the rounds, so the backend reports round 0 forever (found in the Phase 4 pilot).
+platform: parallel
+
+# Used only until a pilot has measured the real values on this machine.
+estimates:
+  fixed_calls_per_run: 120      # ontology, graph extraction, personas, config, report
+  calls_per_round: 12
+  fixed_seconds_per_run: 1200
+  seconds_per_round: 8

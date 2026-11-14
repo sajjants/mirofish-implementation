@@ -90,6 +90,11 @@ if [[ ! -f "$ENV_FILE" ]]; then
     echo "created $ENV_FILE (mode 600, random SECRET_KEY)"
 else
     echo "kept existing $ENV_FILE ($(python3 "$OPS_DIR/scripts/envfile.py" sync "$OPS_DIR/config/mirofish.env.example" "$ENV_FILE"))"
+    # Older .env files point straight at Ollama; route through the LLM meter (Phase 4).
+    if [[ "$(python3 "$OPS_DIR/scripts/envfile.py" get "$ENV_FILE" LLM_BASE_URL 2>/dev/null)" == "http://127.0.0.1:11434/v1" ]]; then
+        python3 "$OPS_DIR/scripts/envfile.py" set "$ENV_FILE" "LLM_BASE_URL=http://127.0.0.1:${LLM_METER_PORT:-11435}/v1"
+        echo "LLM_BASE_URL now goes through the LLM meter on port ${LLM_METER_PORT:-11435}"
+    fi
 fi
 chmod 600 "$ENV_FILE"
 grep -q '^SECRET_KEY=change-me$' "$ENV_FILE" && echo "WARN: SECRET_KEY in $ENV_FILE is still the placeholder"
@@ -100,7 +105,7 @@ fi
 
 step "Private data directories (0700)"
 for dir in "$UPSTREAM_DIR/backend/uploads" "$UPSTREAM_DIR/backend/logs" "$OPS_DIR/logs" "$OPS_DIR/state" \
-           "$OPS_DIR/seeds" "$OPS_DIR/outputs" "$OPS_DIR/runs" "$OPS_DIR/cache"; do
+           "$OPS_DIR/seeds" "$OPS_DIR/outputs" "$OPS_DIR/runs" "$OPS_DIR/cache" "$OPS_DIR/mappings"; do
     make_private_dir "$dir"
     echo "$dir"
 done
@@ -116,7 +121,8 @@ if [[ $RUN_TESTS -eq 1 ]]; then
     step "Backend tests"
     (cd "$UPSTREAM_DIR/backend" && .venv/bin/python -m pytest -q -p no:cacheprovider -W ignore::SyntaxWarning)
     step "Ops tests"
-    python3 -m unittest discover -s "$OPS_DIR/tests"
+    # The backend interpreter has PyYAML (pinned in upstream's uv.lock), which the Phase 4 scripts use.
+    "$UPSTREAM_DIR/backend/.venv/bin/python" -m unittest discover -s "$OPS_DIR/tests"
 fi
 
 step "Local LLM (Ollama)"

@@ -2,7 +2,7 @@
 
 Everything we add lives here; upstream lives untouched in `../mirofish` (pinned in `UPSTREAM.md`). Changes to upstream are only ever applied from `patches/`.
 
-> Status: Phase 3 done (loopback-only, offline, network-checked, purgeable). This README will be completed in Phase 6.
+> Status: Phase 4 wrapper scripts written and tested; pilot measured (see "Batches" below). This README will be completed in Phase 6.
 > Nothing here is validated against real outcomes, and local models weaken persona quality.
 
 ## Set up on a new machine
@@ -31,6 +31,25 @@ Runs are recorded in `ops/runs/<RUN_ID>/manifest.json` (mode 0600, directory 070
 
 Last network check (2026-11-14, full pilot on both platforms): **PASS**. Every connection from MiroFish went to 127.0.0.1 (details in `ZEP_DECISION.md` §3.1).
 
+## Batches: seed + questions -> pilot -> confirmed runs -> checks
+
+Seed format: lines tagged `VERIFIED:`, `ESTIMATE:`, `BELIEF:` or `UNKNOWN:` (see `examples/seed.md`); questions are `## Q1`, `## Q2`, ... sections (`examples/questions.md`). Keep real seeds in `ops/seeds/` (git-ignored).
+
+```bash
+ops/scripts/prepare_inputs.py --batch B1 --seed ops/seeds/seed.md --questions ops/seeds/questions.md \
+    [--terms ops/seeds/terms.txt]          # lint, optional pseudonymisation, requirement text per question
+ops/scripts/unknown_variants.py propose --batch B1   # 3-5 alternatives per UNKNOWN from the local model; edit if needed
+ops/scripts/plan.py --batch B1                       # deterministic plan within config/limits.yaml (prints cuts)
+ops/scripts/start.sh --no-frontend
+ops/scripts/run_batch.py pilot --batch B1            # Q1, 10 rounds; prints measured calls, time, failure rate; STOPS
+ops/scripts/run_batch.py run --batch B1 --confirm    # the planned runs, re-planned from the pilot's measurements
+ops/scripts/factguard.py --batch B1                  # unsupported numbers/dates/entities, inactive actors, UNKNOWN stances
+ops/scripts/compare.py --batch B1                    # trajectory frequencies, resistors, UNKNOWN tables, noise warnings
+ops/scripts/purge.sh B1 --batch                      # shred all runs of the batch, its inputs and mapping
+```
+
+Calls are measured by `scripts/llm_meter.py`, a loopback proxy that `start.sh` puts between MiroFish and Ollama when `LLM_BASE_URL` is `http://127.0.0.1:11435/v1`. It logs per-call metadata only (time, status, tokens, whether JSON or tool-call output parsed) to `logs/llm_meter.jsonl`, never prompt or answer text. Only one batch may run at a time, and nothing else should use MiroFish meanwhile, because calls are attributed to runs by time window.
+
 ## Layout
 
 | Path | Purpose |
@@ -56,13 +75,27 @@ Last network check (2026-11-14, full pilot on both platforms): **PASS**. Every c
 | `scripts/netcheck.sh`, `scripts/netcheck.py` | Pilot run with audit hook and `lsof` sampling; evaluation against `config/allowed_hosts.txt` |
 | `scripts/purge.sh`, `scripts/purge.py` | Overwrite-then-delete everything a run produced |
 | `scripts/injection_check.py` | Measure whether seed instruction text influenced each stage |
+| `config/limits.yaml` | Rounds (pilot 10, real 20-30, ceiling 40), runs per question, call/time/agent caps, cost estimates |
+| `config/rubric.yaml` | Trajectory categories and the resistor definition used by `compare.py` |
+| `scripts/seedfile.py` | Seed/question parsing, instruction lint, UNKNOWN variant substitution |
+| `scripts/pseudonymize.py`, `scripts/depseudonymize.py` | Consistent pseudonyms for listed names, scaled figures; mapping in `mappings/` (0600) |
+| `scripts/prepare_inputs.py` | Builds a batch's upload seed, requirement texts and `inputs.json`; `--submit` drives one question |
+| `scripts/unknown_variants.py` | Alternatives per UNKNOWN (local LLM) and seeded, balanced variants |
+| `scripts/plan.py` | Deterministic planner: cuts rounds first, then runs, and prints each cut |
+| `scripts/llm_meter.py` | Loopback metering proxy in front of Ollama (metadata only) |
+| `scripts/run_batch.py` | Pilot, confirmation gate, planned runs, extended manifests, transcript export, resume |
+| `scripts/factguard.py` | Flags report claims not supported by the seed or the run's variant |
+| `scripts/compare.py` | Classifies runs against the rubric and summarises them with noise warnings |
+| `scripts/local_llm.py`, `scripts/opsconfig.py` | Shared JSON-mode client for the local model; paths and config loading |
+| `examples/` | Fictional seed and questions showing the input format |
+| `mappings/` | Pseudonym mappings (git-ignored, 0700) |
 | `runtime/sitecustomize.py` | Offline tokenizer fix for locked `transformers`, and the network-audit hook (see `UPSTREAM.md`) |
 | `docker/` | Compose override with no internet egress (untested; see `NOTES.md` §10) |
 | `INJECTION_TEST.md` | Seed injection test: method, result, mitigations |
 | `tests/fixtures/` | Synthetic seed (with injection canaries) and question used by `netcheck.sh` |
 | `runs/`, `cache/`, `logs/` | Run manifests and evidence, offline model cache, logs (all git-ignored, 0700) |
 | `patches/` | Re-applicable patches to upstream; listed in `UPSTREAM.md` |
-| `tests/` | Wrapper tests (`python3 -m unittest discover -s ops/tests`) |
+| `tests/` | Wrapper tests (`mirofish/backend/.venv/bin/python -m unittest discover -s ops/tests`; that interpreter has PyYAML from upstream's lockfile) |
 | `state/` | Machine-local generated state, e.g. `hardware_profile.json` (git-ignored) |
 
 ## Quick check of the local LLM (Phase 2)

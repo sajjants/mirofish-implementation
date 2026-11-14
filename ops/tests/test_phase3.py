@@ -305,7 +305,8 @@ class FakeMiroFish:
                     if not fake.started:
                         return self._reply({"runner_status": "idle"})
                     return self._reply({"runner_status": "completed" if fake.closed else "running",
-                                        "reddit_completed": True, "current_round": 10, "total_rounds": 10})
+                                        "reddit_completed": True, "twitter_completed": True,
+                                        "current_round": 10, "total_rounds": 10})
                 if self.path == "/api/report/r1":
                     return self._reply({"markdown_content": "# Report\nbody"})
                 return self._reply("not found", success=False, status=404)
@@ -335,7 +336,7 @@ class FakeMiroFish:
                     return self._reply({"status": "completed", "result": {"report_id": "r1"}})
                 if self.path in routes:
                     if self.path == "/api/simulation/start":
-                        assert body["max_rounds"] == 10 and body["platform"] == "reddit"
+                        assert body["max_rounds"] == 10 and body["platform"] == "parallel"
                         assert body["force"] is False
                         fake.started = True
                     return self._reply(routes[self.path])
@@ -382,7 +383,7 @@ class ApiClientTests(unittest.TestCase):
                 logs = []
                 pipeline = mirofish_api.RunPipeline(client, "r1", runs_dir=runs, log=logs.append,
                                                     poll_interval_s=0.01)
-                kwargs = dict(max_rounds=10, platform="reddit", max_agents=10)
+                kwargs = dict(max_rounds=10, platform="parallel", max_agents=10)
                 with self.assertRaises(mirofish_api.ApiError):
                     pipeline.run([seed], "How will residents react?", **kwargs)
                 manifest = json.loads((runs / "r1" / "manifest.json").read_text())
@@ -414,6 +415,28 @@ class ApiClientTests(unittest.TestCase):
         pipeline = mirofish_api.RunPipeline(mock.Mock(), "x", runs_dir=Path(tempfile.gettempdir()))
         with self.assertRaises(ValueError):
             pipeline.run([], "q", max_rounds=41)
+
+    def test_rounds_stall_is_reported(self):
+        client = mock.Mock()
+        client.post_multipart.return_value = {"project_id": "p"}
+        responses = {"/api/graph/task/t": {"status": "completed", "result": {"graph_id": "g"}},
+                     "/api/simulation/s/run-status": {"runner_status": "running", "current_round": 0,
+                                                      "total_actions_count": 0}}
+        client.get.side_effect = lambda path, **kw: responses[path]
+        client.post.side_effect = lambda path, payload, **kw: {
+            "/api/graph/build": {"task_id": "t"}, "/api/simulation/create": {"simulation_id": "s"},
+            "/api/simulation/prepare": {"already_prepared": True}, "/api/simulation/start": {}}[path]
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline = mirofish_api.RunPipeline(client, "stall", runs_dir=Path(tmp), log=lambda m: None,
+                                                poll_interval_s=0.01)
+            with self.assertRaisesRegex(mirofish_api.ApiError, "no progress for 0s"):
+                pipeline.run([], "q", max_rounds=10, stall_timeout_s=0.05)
+
+    def test_single_platform_modes_refused(self):
+        pipeline = mirofish_api.RunPipeline(mock.Mock(), "x", runs_dir=Path(tempfile.gettempdir()))
+        for platform in ("reddit", "twitter"):
+            with self.assertRaisesRegex(ValueError, "never report the end of the rounds"):
+                pipeline.run([], "q", max_rounds=10, platform=platform)
 
 
 class RuntimeHookTests(unittest.TestCase):

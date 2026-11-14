@@ -219,21 +219,58 @@ def purge(run_id: str, *, include_logs: bool, client: Optional[MiroFishClient] =
     return done
 
 
+def batch_run_ids(batch_id: str, runs_dir: Path = OPS_DIR / "runs") -> List[str]:
+    """Runs recorded in the batch state plus any ops/runs/<BATCH_ID>_* run with a manifest."""
+    found: Set[str] = set()
+    state_path = runs_dir / batch_id / "batch.json"
+    if state_path.exists():
+        found.update(json.loads(state_path.read_text(encoding="utf-8")).get("runs", {}))
+    found.update(p.parent.name for p in runs_dir.glob(f"{batch_id}_*/manifest.json"))
+    return sorted(r for r in found if (runs_dir / r / "manifest.json").exists())
+
+
+def purge_batch(batch_id: str, *, include_logs: bool, client: Optional[MiroFishClient] = None,
+                log=print) -> List[str]:
+    """Purge every run of a batch, then the batch directory and its pseudonym mapping."""
+    batch_path = checked_child(OPS_DIR / "runs", validate_run_id(batch_id))
+    if not batch_path.is_dir():
+        raise FileNotFoundError(f"no batch directory at {batch_path}")
+    done: List[str] = []
+    run_ids = batch_run_ids(batch_id)
+    for index, run_id in enumerate(run_ids):
+        done += purge(run_id, include_logs=include_logs and index == len(run_ids) - 1, client=client, log=log)
+    warnings: List[str] = []
+    tail = [f"batch {batch_id}: shredded {shred_tree(batch_path, warnings)} files"]
+    mapping_file = OPS_DIR / "mappings" / f"{batch_id}.mapping.json"
+    if mapping_file.exists() and not mapping_file.is_symlink():
+        shred_file(mapping_file, warnings)
+        tail.append(f"mapping {mapping_file.name}: shredded")
+    tail.extend(f"WARN: {w}" for w in warnings)
+    for line in tail:
+        log(line)
+    return done + tail
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("run_id")
+    parser.add_argument("run_id", help="run id, or a batch id with --batch")
+    parser.add_argument("--batch", action="store_true", help="purge every run of batch RUN_ID plus its inputs and mapping")
     parser.add_argument("--logs", action="store_true", help="also shred all backend and ops logs")
     parser.add_argument("--yes", action="store_true", help="do not ask for confirmation")
     args = parser.parse_args(argv)
     validate_run_id(args.run_id)
     if not args.yes:
         scope = " and ALL log files" if args.logs else ""
-        answer = input(f"Permanently delete run {args.run_id}{scope}? Type the run id to confirm: ")
+        what = "batch (all its runs, inputs and mapping)" if args.batch else "run"
+        answer = input(f"Permanently delete {what} {args.run_id}{scope}? Type the id to confirm: ")
         if answer.strip() != args.run_id:
             print("aborted")
             return 1
     try:
-        purge(args.run_id, include_logs=args.logs)
+        if args.batch:
+            purge_batch(args.run_id, include_logs=args.logs)
+        else:
+            purge(args.run_id, include_logs=args.logs)
     except (OSError, ValueError, RuntimeError) as exc:
         print(f"FAIL: {exc}", file=sys.stderr)
         return 1

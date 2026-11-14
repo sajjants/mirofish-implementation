@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Stop the MiroFish frontend and backend started by start.sh, including simulation
+# Stop the MiroFish frontend, backend and LLM meter started by start.sh, including simulation
 # subprocesses (which run in their own sessions). Ollama is left running unless --ollama.
 # Usage: ops/scripts/stop.sh [--ollama]
 set -uo pipefail
 
 OPS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 STATE="$OPS_DIR/state"
-names=(frontend backend)
+names=(frontend backend meter)
 [[ "${1:-}" == "--ollama" ]] && names+=(ollama)
 
 descendants() {
@@ -23,6 +23,7 @@ expected_command() {
     case "$1" in
         backend) echo "run.py" ;;
         frontend) echo "vite" ;;
+        meter) echo "llm_meter.py" ;;
         ollama) echo "ollama serve" ;;
     esac
 }

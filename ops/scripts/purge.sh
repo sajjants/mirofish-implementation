@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Securely delete a run's outputs, graph data and evidence. See purge.py for what is removed.
 # Usage: ops/scripts/purge.sh RUN_ID [--logs] [--yes]
+#        ops/scripts/purge.sh BATCH_ID --batch [--logs] [--yes]   # every run of a batch + inputs + mapping
 #   --logs  also shred every backend and ops log file (requires MiroFish stopped)
 #   --yes   skip the confirmation prompt
 # Works with MiroFish running (graph deleted through the API) or stopped (deleted directly).

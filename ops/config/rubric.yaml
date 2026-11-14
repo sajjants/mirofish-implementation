@@ -1,0 +1,18 @@
+# Trajectory rubric for ops/scripts/compare.py. Edit freely: ids must be unique snake_case.
+# The classifier reads the simulated discussion (posts, comments, agent stances), not the report.
+
+trajectories:
+  - id: broad_acceptance
+    description: The proposal or main development is accepted with little sustained opposition; critics fade or are won over.
+  - id: contested_acceptance
+    description: It goes ahead or gains majority support, but only after visible, sustained opposition or concessions.
+  - id: stalemate
+    description: No side gains ground; positions stay entrenched and the discussion ends unresolved.
+  - id: rejection
+    description: Opposition prevails; the proposal is blocked, withdrawn, reversed or loses majority support.
+  - id: fragmentation
+    description: The discussion splinters into side issues or hostile camps with no coherent overall direction.
+
+resistors: >-
+  Agents who actively push against the dominant direction of the discussion (organising, arguing,
+  threatening action), not merely agents who post a negative remark once.

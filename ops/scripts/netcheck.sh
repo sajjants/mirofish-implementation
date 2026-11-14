@@ -68,7 +68,7 @@ trap cleanup EXIT
 "$OPS_DIR/scripts/start.sh" --netaudit "$AUDIT"
 
 python3 "$OPS_DIR/scripts/netcheck.py" sample --out "$LSOF" \
-    --pidfile "$STATE/backend.pid" --pidfile "$STATE/frontend.pid" \
+    --pidfile "$STATE/backend.pid" --pidfile "$STATE/frontend.pid" --pidfile "$STATE/meter.pid" \
     --ollama-port "${OLLAMA_HOST##*:}" --interval 1 &
 sampler_pid=$!
 sleep 2

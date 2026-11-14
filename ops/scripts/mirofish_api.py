@@ -8,7 +8,7 @@ after the last completed stage.
 
   mirofish_api.py health
   mirofish_api.py run --run-id ID --seed FILE [--seed FILE ...] --requirement-file FILE
-                      [--max-rounds 10] [--platform reddit] [--max-agents N]
+                      [--max-rounds 10] [--max-agents N]
 """
 
 from __future__ import annotations
@@ -34,7 +34,11 @@ OPS_DIR = Path(__file__).resolve().parent.parent
 RUNS_DIR = OPS_DIR / "runs"
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
-PLATFORMS = ("reddit", "twitter", "parallel")
+# Upstream's single-platform scripts (run_reddit_simulation.py, run_twitter_simulation.py) never
+# write <platform>/actions.jsonl or its simulation_end event, which is how the backend detects the
+# end of the rounds; a 'reddit' or 'twitter' run therefore reports round 0 forever. Only the
+# parallel script logs actions, so it is the only mode this wrapper drives.
+PLATFORMS = ("parallel",)
 
 
 class ApiError(RuntimeError):
@@ -218,12 +222,14 @@ class RunPipeline:
         self.log(f"[{name}] done in {stages[name]['seconds']}s")
         return result
 
-    def run(self, seed_files: List[Path], requirement: str, *, max_rounds: int, platform: str = "reddit",
+    def run(self, seed_files: List[Path], requirement: str, *, max_rounds: int, platform: str = "parallel",
             max_agents: Optional[int] = None, entity_types: Optional[List[str]] = None,
             enable_graph_memory_update: bool = False, project_name: Optional[str] = None,
-            stage_timeout_s: float = 4 * 3600, until: Optional[str] = None) -> Dict[str, Any]:
+            stage_timeout_s: float = 4 * 3600, until: Optional[str] = None,
+            stall_timeout_s: float = 1800) -> Dict[str, Any]:
         if platform not in PLATFORMS:
-            raise ValueError(f"platform must be one of {PLATFORMS}")
+            raise ValueError(f"platform must be one of {PLATFORMS}: upstream's single-platform scripts never "
+                             "report the end of the rounds, so the run would wait forever")
         if not 1 <= int(max_rounds) <= 40:
             raise ValueError("max_rounds must be between 1 and 40 (hard ceiling)")
         inputs = {
@@ -308,8 +314,19 @@ class RunPipeline:
                     "enable_graph_memory_update": enable_graph_memory_update,
                     "force": current in ("stopped", "failed"),
                 }, timeout=120)
-            state = self._poll(lambda: c.get(f"/api/simulation/{simulation_id}/run-status"),
-                         lambda s: rounds_done(s, platform), "rounds", stage_timeout_s)
+            progress = {"key": None, "since": time.monotonic()}
+
+            def fetch_with_stall_check() -> Dict[str, Any]:
+                state = c.get(status_path)
+                key = (state.get("current_round"), state.get("total_actions_count"), state.get("runner_status"))
+                if key != progress["key"]:
+                    progress.update(key=key, since=time.monotonic())
+                elif not rounds_done(state, platform) and time.monotonic() - progress["since"] > stall_timeout_s:
+                    raise ApiError(f"rounds: no progress for {int(stall_timeout_s)}s (round {key[0]}, "
+                                   f"{key[1]} actions, {key[2]}); check the simulation directory's logs")
+                return state
+
+            state = self._poll(fetch_with_stall_check, lambda s: rounds_done(s, platform), "rounds", stage_timeout_s)
             keys = ("current_round", "total_rounds", "twitter_actions_count", "reddit_actions_count",
                     "total_actions_count", "runner_status", "started_at")
             return {k: state.get(k) for k in keys}
@@ -363,7 +380,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     run.add_argument("--seed", action="append", required=True, type=Path)
     run.add_argument("--requirement-file", required=True, type=Path)
     run.add_argument("--max-rounds", type=int, default=10)
-    run.add_argument("--platform", choices=PLATFORMS, default="reddit")
+    run.add_argument("--platform", choices=PLATFORMS, default="parallel")
     run.add_argument("--max-agents", type=int)
     run.add_argument("--entity-type", action="append", dest="entity_types")
     run.add_argument("--graph-memory-update", action="store_true")
