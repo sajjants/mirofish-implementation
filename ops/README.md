@@ -7,6 +7,17 @@ This directory runs the real [MiroFish](https://github.com/666ghj/MiroFish) on y
 > - **Local models weaken persona quality.** A 30B quantised model run on a laptop gives flatter, more repetitive personas than the large cloud models MiroFish was built for. It follows formats less reliably and invents figures, dates and events (see `INJECTION_TEST.md` and the factguard output of any run).
 > - With 2–3 runs per question, differences between runs may be chance. Treat outputs as a handful of samples from a noisy generator.
 
+## Quick start for a new teammate
+
+1. **Prerequisites:** macOS or Linux (Windows via WSL), Git, uv, Node.js 18+, `lsof`, Ollama, and about 24 GB of GPU or unified memory. With less, first pick a smaller `HF_MODEL_REF` in `config/model.conf` (section 2).
+2. **Clone into a folder that no sync or backup tool uploads** (not Google Drive, iCloud, Dropbox or OneDrive).
+3. **Run the setup:** `ops/scripts/bootstrap.sh --with-models` (about 19 GB of models plus about 1.1 GB of cached assets; safe to re-run).
+4. **Check `ops/scripts/doctor.sh` passes**, in particular the JSON compliance check.
+5. **Start:** `ops/scripts/ollama_serve.sh`, then `ops/scripts/start.sh --no-frontend`. **Stop:** `ops/scripts/stop.sh --ollama`.
+6. **Run a pilot** with your own seed and questions (sections 4–6). Seeds, runs, mappings, logs and `.env` are git-ignored, so nothing private comes with the clone.
+
+The time estimates in `config/limits.yaml` come from an M3 Max; the pilot re-measures them on your machine. MiroFish is AGPL-3.0 and `patches/` modify it, which is fine for private use; read the licence notes in `NOTES.md` before running it as a service for others.
+
 Status: Phases 1–6 complete. 82 wrapper tests pass. The Phase 5 checks on the real stack are recorded under "Verification" below.
 
 ## 1. Install
