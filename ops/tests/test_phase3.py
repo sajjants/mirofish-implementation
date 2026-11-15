@@ -275,7 +275,7 @@ class PurgeTests(unittest.TestCase):
 class FakeMiroFish:
     """Just enough of the MiroFish API for one run, on a loopback port."""
 
-    def __init__(self, fail_report_once: bool = False):
+    def __init__(self, fail_report_once: bool = False, expected_agents: int = 12):
         self.calls = []
         self.fail_report = fail_report_once
         self.closed = False
@@ -321,7 +321,7 @@ class FakeMiroFish:
                 routes = {
                     "/api/graph/build": {"task_id": "t1"},
                     "/api/simulation/create": {"simulation_id": "sim_1"},
-                    "/api/simulation/prepare": {"task_id": "t2", "expected_entities_count": 12},
+                    "/api/simulation/prepare": {"task_id": "t2", "expected_entities_count": expected_agents},
                     "/api/simulation/prepare/status": {"status": "completed"},
                     "/api/simulation/start": {"runner_status": "running"},
                     "/api/report/generate": {"report_id": "r1", "task_id": "t3"},
@@ -431,6 +431,44 @@ class ApiClientTests(unittest.TestCase):
                                                 poll_interval_s=0.01)
             with self.assertRaisesRegex(mirofish_api.ApiError, "no progress for 0s"):
                 pipeline.run([], "q", max_rounds=10, stall_timeout_s=0.05)
+
+    def test_wrong_agent_count_after_prepare_fails_and_rerun_regenerates(self):
+        def write_prepared(sim_dir, agents):
+            sim_dir.mkdir(parents=True, exist_ok=True)
+            (sim_dir / "reddit_profiles.json").write_text(json.dumps([{"user_id": i} for i in range(agents)]))
+            rows = "".join(f'{i},agent {i},agent_{i},"persona, {i}",desc\n' for i in range(agents))
+            (sim_dir / "twitter_profiles.csv").write_text("user_id,name,username,user_char,description\n" + rows)
+            (sim_dir / "simulation_config.json").write_text(
+                json.dumps({"agent_configs": [{"agent_id": i} for i in range(agents)]}))
+
+        prepares = []
+        client = mock.Mock()
+        client.post_multipart.return_value = {"project_id": "p"}
+        client.get.return_value = {"status": "completed", "result": {"graph_id": "g"}}
+
+        def post(path, payload, **kw):
+            if path == "/api/simulation/prepare":
+                prepares.append(payload)
+            return {"/api/graph/build": {"task_id": "t"}, "/api/simulation/create": {"simulation_id": "sim_s"},
+                    "/api/simulation/prepare": {"task_id": "t2", "expected_entities_count": 4},
+                    "/api/simulation/prepare/status": {"status": "completed"}}[path]
+
+        client.post.side_effect = post
+        with tempfile.TemporaryDirectory() as tmp:
+            sims = Path(tmp, "simulations")
+            write_prepared(sims / "sim_s", 9)
+            make = lambda: mirofish_api.RunPipeline(client, "mm", runs_dir=Path(tmp, "runs"), log=lambda m: None,
+                                                    poll_interval_s=0.01, simulations_dir=sims)
+            with self.assertRaisesRegex(mirofish_api.PrepareMismatch, "expected 4, found reddit_profiles.json 9"):
+                make().run([], "q", max_rounds=10, until="prepare")
+            self.assertNotIn("force_regenerate", prepares[0])
+
+            write_prepared(sims / "sim_s", 4)
+            manifest = make().run([], "q", max_rounds=10, until="prepare")
+            self.assertTrue(prepares[1]["force_regenerate"])
+            self.assertNotIn("prepare_mismatch", manifest)
+            self.assertEqual(manifest["stages"]["prepare"]["result"]["agent_files"],
+                             {"reddit_profiles.json": 4, "twitter_profiles.csv": 4, "simulation_config.json": 4})
 
     def test_single_platform_modes_refused(self):
         pipeline = mirofish_api.RunPipeline(mock.Mock(), "x", runs_dir=Path(tempfile.gettempdir()))

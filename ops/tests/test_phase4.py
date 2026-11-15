@@ -475,6 +475,9 @@ def make_simulation_dir(root: Path, simulation_id: str = "sim_1") -> None:
         {"agent_id": 0, "entity_name": "Tomas Reyes", "entity_type": "Councillor", "stance": "opposing"},
         {"agent_id": 1, "entity_name": "Elena Duarte", "entity_type": "Mayor", "stance": "supportive"},
     ]}))
+    (sim / "reddit_profiles.json").write_text(json.dumps([{"user_id": 0}, {"user_id": 1}]))
+    (sim / "twitter_profiles.csv").write_text("user_id,name,username,user_char,description\n"
+                                              "0,Tomas Reyes,treyes,,\n1,Elena Duarte,eduarte,,\n")
     db = sqlite3.connect(sim / "reddit_simulation.db")
     db.executescript("""
         CREATE TABLE user (user_id INTEGER PRIMARY KEY, agent_id INTEGER, user_name TEXT, name TEXT, bio TEXT,
@@ -554,7 +557,7 @@ class BatchTests(unittest.TestCase):
         self.prepare()
         llm = FakeLLM([lambda prompt: {"alternatives": ["Option one.", "Option two.", "Option three."]}])
         unknown_variants.propose("b1", llm=llm)
-        server = FakeMiroFish()
+        server = FakeMiroFish(expected_agents=2)
         meter_log = self.root / "meter.jsonl"
 
         def fake_meter(path=None, start=0.0, end=None):
@@ -572,7 +575,7 @@ class BatchTests(unittest.TestCase):
                 with self.assertRaises(run_batch.BatchError):
                     batch.run()  # no pilot yet
                 pilot = batch.pilot()
-                self.assertEqual(pilot["agents"], 12)
+                self.assertEqual(pilot["agents"], 2)
                 self.assertEqual(pilot["cost_model"]["calls_per_round"], 0.0)
                 self.assertGreater(pilot["cost_model"]["calls_per_turn"], 0)
                 sim_config = json.loads((self.sims / "sim_1" / "simulation_config.json").read_text())
@@ -605,7 +608,7 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(purge.batch_run_ids("b1", self.runs), sorted(state["runs"]))
 
     def test_zep_cloud_backend_needs_a_pseudonymised_batch(self):
-        server = FakeMiroFish()
+        server = FakeMiroFish(expected_agents=2)
         try:
             for terms, allowed in ((False, False), (True, True)):
                 shutil.rmtree(self.runs / "b1", ignore_errors=True)
@@ -624,7 +627,7 @@ class BatchTests(unittest.TestCase):
     def test_killed_batch_resumes_without_repeating_finished_runs(self):
         self.prepare()
         unknown_variants.propose("b1", llm=FakeLLM([lambda p: {"alternatives": ["One.", "Two.", "Three."]}]))
-        server = FakeMiroFish()
+        server = FakeMiroFish(expected_agents=2)
         prepared = []
 
         def log(message):

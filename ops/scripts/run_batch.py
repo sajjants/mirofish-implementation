@@ -302,7 +302,7 @@ class Batch:
             self.log(f"{run_id}: already done, skipping")
             return record
         pipeline = RunPipeline(self.client, run_id, runs_dir=self.runs_dir, log=self.log,
-                               poll_interval_s=self.poll_interval_s)
+                               poll_interval_s=self.poll_interval_s, simulations_dir=self.simulations_dir)
         if "batch" not in pipeline.manifest:
             pipeline.manifest["batch"] = {
                 "batch_id": self.batch_id, "kind": kind, "question": question_id,

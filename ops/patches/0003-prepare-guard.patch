@@ -1,0 +1,265 @@
+diff --git a/backend/app/api/report.py b/backend/app/api/report.py
+index a1e7dbc..2b9105a 100644
+--- a/backend/app/api/report.py
++++ b/backend/app/api/report.py
+@@ -18,6 +18,7 @@ from ..models.project import ProjectManager, ProjectStatus
+ from ..models.task import TaskManager, TaskStatus
+ from ..utils.logger import get_logger
+ from ..utils.locale import t, get_locale, set_locale
++from ..utils.wrapper_token import require_wrapper_token
+ from ..utils.zep_lifecycle import (
+     graph_lifecycle_lock,
+     register_graph_reader,
+@@ -30,6 +31,7 @@ logger = get_logger('mirofish.api.report')
+ # ============== 报告生成接口 ==============
+ 
+ @report_bp.route('/generate', methods=['POST'])
++@require_wrapper_token
+ def generate_report():
+     """
+     生成模拟分析报告（异步任务）
+diff --git a/backend/app/api/simulation.py b/backend/app/api/simulation.py
+index aae7678..0bf09f2 100644
+--- a/backend/app/api/simulation.py
++++ b/backend/app/api/simulation.py
+@@ -3,10 +3,12 @@
+ Step2: Zep实体读取与过滤、OASIS模拟准备与运行（全程自动化）
+ """
+ 
++import functools
+ import os
++import threading
+ import traceback
+ from contextlib import nullcontext
+-from flask import request, jsonify, send_file
++from flask import g, request, jsonify, send_file
+ 
+ from . import simulation_bp
+ from ..config import Config
+@@ -22,6 +24,7 @@ from ..services.zep_graph_memory_updater import ZepGraphMemoryManager
+ from ..utils.logger import get_logger
+ from ..utils.locale import t, get_locale, set_locale
+ from ..utils.zep_lifecycle import get_graph_readers, graph_lifecycle_lock
++from ..utils.wrapper_token import require_wrapper_token
+ from ..models.project import ProjectManager
+ 
+ logger = get_logger('mirofish.api.simulation')
+@@ -193,6 +196,7 @@ def get_entities_by_type(graph_id: str, entity_type: str):
+ # ============== 模拟管理接口 ==============
+ 
+ @simulation_bp.route('/create', methods=['POST'])
++@require_wrapper_token
+ def create_simulation():
+     """
+     创建新的模拟
+@@ -386,7 +390,53 @@ def _check_simulation_prepared(simulation_id: str) -> tuple:
+         return False, {"reason": f"读取状态文件失败: {str(e)}"}
+ 
+ 
++_prepare_lock = threading.Lock()
++_preparing_ids = set()
++
++
++def _reserve_prepare(simulation_id):
++    with _prepare_lock:
++        if simulation_id in _preparing_ids:
++            return False
++        _preparing_ids.add(simulation_id)
++        return True
++
++
++def _release_prepare(simulation_id):
++    with _prepare_lock:
++        _preparing_ids.discard(simulation_id)
++
++
++def _guard_prepare(view):
++    """One prepare task per simulation at a time.
++
++    Without this, a second /prepare (e.g. the Step 2 page) while a task runs starts another task that
++    overwrites the first one's profiles and config: _check_simulation_prepared only sees finished work.
++    The reservation is held until the background task ends; the view sets g.prepare_started once it
++    has handed the reservation to that task.
++    """
++    @functools.wraps(view)
++    def wrapper(*args, **kwargs):
++        simulation_id = (request.get_json(silent=True) or {}).get('simulation_id')
++        if not simulation_id:
++            return view(*args, **kwargs)
++        if not _reserve_prepare(simulation_id):
++            return jsonify({
++                "success": False,
++                "error": f"A prepare task is already running for {simulation_id}; wait for it to finish."
++            }), 409
++        g.prepare_started = False
++        try:
++            return view(*args, **kwargs)
++        finally:
++            if not g.prepare_started:
++                _release_prepare(simulation_id)
++    return wrapper
++
++
+ @simulation_bp.route('/prepare', methods=['POST'])
++@require_wrapper_token
++@_guard_prepare
+ def prepare_simulation():
+     """
+     准备模拟环境（异步任务，LLM智能生成所有参数）
+@@ -641,10 +691,13 @@ def prepare_simulation():
+                     state.status = SimulationStatus.FAILED
+                     state.error = str(e)
+                     manager._save_simulation_state(state)
++            finally:
++                _release_prepare(simulation_id)
+         
+         # 启动后台线程
+         thread = threading.Thread(target=run_prepare, daemon=True)
+         thread.start()
++        g.prepare_started = True
+         
+         return jsonify({
+             "success": True,
+diff --git a/backend/app/utils/wrapper_token.py b/backend/app/utils/wrapper_token.py
+new file mode 100644
+index 0000000..d6512d1
+--- /dev/null
++++ b/backend/app/utils/wrapper_token.py
+@@ -0,0 +1,28 @@
++"""Routes reserved for a wrapper that drives the API (MIROFISH_WRAPPER_TOKEN).
++
++When MIROFISH_WRAPPER_TOKEN is set, decorated routes answer 403 unless the request sends it in
++X-MiroFish-Wrapper-Token. The web page cannot know the token, so it cannot start that work while
++the wrapper owns the run. Unset, upstream behaviour is unchanged.
++"""
++
++import functools
++import hmac
++import os
++
++from flask import jsonify, request
++
++WRAPPER_TOKEN_HEADER = 'X-MiroFish-Wrapper-Token'
++
++
++def require_wrapper_token(view):
++    @functools.wraps(view)
++    def wrapper(*args, **kwargs):
++        token = os.environ.get('MIROFISH_WRAPPER_TOKEN', '')
++        if token and not hmac.compare_digest(request.headers.get(WRAPPER_TOKEN_HEADER, ''), token):
++            return jsonify({
++                "success": False,
++                "error": "This server does this only for the wrapper that started it "
++                         "(MIROFISH_WRAPPER_TOKEN is set)."
++            }), 403
++        return view(*args, **kwargs)
++    return wrapper
+diff --git a/backend/tests/test_simulation_prepare_guard.py b/backend/tests/test_simulation_prepare_guard.py
+new file mode 100644
+index 0000000..33b1867
+--- /dev/null
++++ b/backend/tests/test_simulation_prepare_guard.py
+@@ -0,0 +1,103 @@
++"""/api/simulation/prepare: one task per simulation at a time; MIROFISH_WRAPPER_TOKEN routes."""
++
++import threading
++import time
++from types import SimpleNamespace
++
++import pytest
++
++from app import create_app
++from app.api import simulation as simulation_api
++from app.services.simulation_manager import SimulationManager, SimulationState, SimulationStatus
++from app.utils.wrapper_token import WRAPPER_TOKEN_HEADER
++
++BASE_URL = "http://localhost:5001"
++TOKEN = "wrapper-token-for-tests-only"
++
++
++@pytest.fixture
++def client(monkeypatch):
++    monkeypatch.delenv("MIROFISH_WRAPPER_TOKEN", raising=False)
++    monkeypatch.setattr(simulation_api, "_preparing_ids", set())
++    return create_app().test_client()
++
++
++@pytest.fixture
++def blocking_prepare(monkeypatch):
++    """A simulation whose background prepare runs until `release` is set."""
++    release, finished = threading.Event(), threading.Event()
++    state = SimulationState(simulation_id="sim_guard", project_id="proj", graph_id="graph",
++                            status=SimulationStatus.CREATED)
++
++    def prepare_simulation(self, **kwargs):
++        release.wait(5)
++        finished.set()
++        return SimulationState(simulation_id="sim_guard", project_id="proj", graph_id="graph",
++                               status=SimulationStatus.READY)
++
++    class NoZep:
++        def filter_defined_entities(self, **kwargs):
++            raise RuntimeError("no Zep in tests")
++
++    monkeypatch.setattr(SimulationManager, "get_simulation", lambda self, sid: state if sid == "sim_guard" else None)
++    monkeypatch.setattr(SimulationManager, "_save_simulation_state", lambda self, s: None)
++    monkeypatch.setattr(SimulationManager, "prepare_simulation", prepare_simulation)
++    monkeypatch.setattr(simulation_api, "_check_simulation_prepared", lambda sid: (False, {}))
++    monkeypatch.setattr(simulation_api, "ZepEntityReader", NoZep)
++    monkeypatch.setattr(simulation_api.ProjectManager, "get_project",
++                        staticmethod(lambda pid: SimpleNamespace(simulation_requirement="requirement")))
++    monkeypatch.setattr(simulation_api.ProjectManager, "get_extracted_text", staticmethod(lambda pid: "text"))
++    yield SimpleNamespace(release=release, finished=finished)
++    release.set()
++
++
++def _prepare(client, simulation_id="sim_guard", headers=None):
++    return client.post("/api/simulation/prepare", json={"simulation_id": simulation_id},
++                       headers=headers or {}, base_url=BASE_URL)
++
++
++def test_second_prepare_is_refused_while_the_first_task_runs(client, blocking_prepare):
++    first = _prepare(client)
++    assert first.status_code == 200
++    assert first.get_json()["data"]["already_prepared"] is False
++
++    second = _prepare(client)
++    assert second.status_code == 409
++    assert "already running" in second.get_json()["error"]
++
++    blocking_prepare.release.set()
++    assert blocking_prepare.finished.wait(5)
++    deadline = time.monotonic() + 5
++    while "sim_guard" in simulation_api._preparing_ids and time.monotonic() < deadline:
++        time.sleep(0.02)
++    assert _prepare(client).status_code == 200
++
++
++def test_a_request_that_starts_no_task_releases_the_simulation(client):
++    assert _prepare(client, "sim_missing").status_code == 404
++    assert _prepare(client, "sim_missing").status_code == 404
++    assert simulation_api._preparing_ids == set()
++
++
++def test_token_is_required_for_prepare_when_configured(client, monkeypatch, blocking_prepare):
++    monkeypatch.setenv("MIROFISH_WRAPPER_TOKEN", TOKEN)
++    assert _prepare(client).status_code == 403
++    assert _prepare(client, headers={WRAPPER_TOKEN_HEADER: "wrong"}).status_code == 403
++    assert simulation_api._preparing_ids == set()
++    assert _prepare(client, headers={WRAPPER_TOKEN_HEADER: TOKEN}).status_code == 200
++
++
++@pytest.mark.parametrize("path", ["/api/simulation/create", "/api/report/generate"])
++def test_token_is_required_to_create_simulations_and_generate_reports(client, monkeypatch, path):
++    monkeypatch.setenv("MIROFISH_WRAPPER_TOKEN", TOKEN)
++    refused = client.post(path, json={}, base_url=BASE_URL)
++    assert refused.status_code == 403
++    assert "MIROFISH_WRAPPER_TOKEN" in refused.get_json()["error"]
++    # With the token the route's own validation runs (missing ids).
++    allowed = client.post(path, json={}, headers={WRAPPER_TOKEN_HEADER: TOKEN}, base_url=BASE_URL)
++    assert allowed.status_code == 400
++
++
++def test_no_token_configured_keeps_upstream_behaviour(client):
++    assert _prepare(client, "sim_missing").status_code == 404
++    assert client.post("/api/simulation/create", json={}, base_url=BASE_URL).status_code == 400

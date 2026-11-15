@@ -14,6 +14,7 @@ after the last completed stage.
 from __future__ import annotations
 
 import argparse
+import csv
 import functools
 import hashlib
 import json
@@ -32,6 +33,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional
 
 OPS_DIR = Path(__file__).resolve().parent.parent
 RUNS_DIR = OPS_DIR / "runs"
+SIMULATIONS_DIR = OPS_DIR.parent / "mirofish" / "backend" / "uploads" / "simulations"
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 # Upstream's single-platform scripts (run_reddit_simulation.py, run_twitter_simulation.py) never
@@ -43,6 +45,30 @@ PLATFORMS = ("parallel",)
 
 class ApiError(RuntimeError):
     """The backend answered with success=false, an HTTP error, or a failed task."""
+
+
+class PrepareMismatch(ApiError):
+    """Prepare finished, but its files do not hold the expected number of agents."""
+
+
+def prepared_agent_counts(sim_dir: Path) -> Dict[str, Optional[int]]:
+    """Agents in each file prepare writes; None for a file that is missing or unreadable."""
+    counts: Dict[str, Optional[int]] = {}
+
+    def read(name: str, count: Callable[[Path], int]) -> None:
+        try:
+            counts[name] = count(sim_dir / name)
+        except (OSError, ValueError, KeyError, TypeError, csv.Error):
+            counts[name] = None
+
+    def csv_rows(path: Path) -> int:
+        with open(path, newline="", encoding="utf-8") as handle:
+            return sum(1 for _ in csv.DictReader(handle))
+
+    read("reddit_profiles.json", lambda p: len(json.loads(p.read_text(encoding="utf-8"))))
+    read("twitter_profiles.csv", csv_rows)
+    read("simulation_config.json", lambda p: len(json.loads(p.read_text(encoding="utf-8"))["agent_configs"]))
+    return counts
 
 
 def default_base_url() -> str:
@@ -188,8 +214,11 @@ class RunPipeline:
     STAGES = ("ontology", "graph", "simulation", "prepare", "schedule", "rounds", "close_env", "report")
 
     def __init__(self, client: MiroFishClient, run_id: str, runs_dir: Path = RUNS_DIR,
-                 log: Callable[[str], None] = print, poll_interval_s: float = 5.0):
+                 log: Callable[[str], None] = print, poll_interval_s: float = 5.0,
+                 simulations_dir: Optional[Path] = None):
+        """simulations_dir: where upstream writes simulations; given, prepare's agent files are checked."""
         self.client = client
+        self.simulations_dir = simulations_dir
         self.run_id = validate_run_id(run_id)
         self.run_dir = runs_dir / run_id
         self.manifest_path = self.run_dir / "manifest.json"
@@ -289,6 +318,9 @@ class RunPipeline:
             payload: Dict[str, Any] = {"simulation_id": simulation_id, "use_llm_for_profiles": True}
             if entity_types:
                 payload["entity_types"] = entity_types
+            if self.manifest.pop("prepare_mismatch", False):
+                # Upstream would otherwise return the mismatched files as already prepared.
+                payload["force_regenerate"] = True
             data = c.post("/api/simulation/prepare", payload, timeout=300)
             agents = data.get("expected_entities_count")
             if max_agents is not None and agents is not None and agents > max_agents:
@@ -298,7 +330,20 @@ class RunPipeline:
                 self._poll(lambda: c.post("/api/simulation/prepare/status",
                                     {"task_id": task_id, "simulation_id": simulation_id}),
                      lambda s: s.get("status") in ("completed", "ready"), "prepare", stage_timeout_s)
-            return {"expected_entities_count": agents}
+            else:
+                agents = (data.get("prepare_info") or {}).get("entities_count")
+            result: Dict[str, Any] = {"expected_entities_count": agents}
+            if self.simulations_dir is not None:
+                counts = prepared_agent_counts(self.simulations_dir / simulation_id)
+                if not agents or any(n != agents for n in counts.values()):
+                    self.manifest["prepare_mismatch"] = True
+                    found = ", ".join(f"{name} {'missing' if n is None else n}" for name, n in counts.items())
+                    raise PrepareMismatch(
+                        f"prepare wrote the wrong number of agents: expected {agents}, found {found}. Something "
+                        "else (for example the MiroFish web page) may have started a prepare for this "
+                        "simulation. Run the same command again to regenerate the personas.")
+                result["agent_files"] = counts
+            return result
 
         self._stage("prepare", prepare)
         if until == "prepare":
@@ -397,7 +442,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("ok" if ok else "unreachable")
         return 0 if ok else 1
     requirement = args.requirement_file.read_text(encoding="utf-8").strip()
-    manifest = RunPipeline(client, args.run_id).run(
+    manifest = RunPipeline(client, args.run_id, simulations_dir=SIMULATIONS_DIR).run(
         args.seed, requirement, max_rounds=args.max_rounds, platform=args.platform,
         max_agents=args.max_agents, entity_types=args.entity_types,
         enable_graph_memory_update=args.graph_memory_update, until=args.until)
