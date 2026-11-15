@@ -470,6 +470,35 @@ class ApiClientTests(unittest.TestCase):
             self.assertEqual(manifest["stages"]["prepare"]["result"]["agent_files"],
                              {"reddit_profiles.json": 4, "twitter_profiles.csv": 4, "simulation_config.json": 4})
 
+    def test_entity_type_missing_from_the_graph_fails_before_prepare_and_can_be_corrected(self):
+        prepares = []
+        client = mock.Mock()
+        client.post_multipart.return_value = {"project_id": "p"}
+        client.get.return_value = {"status": "completed", "result": {"graph_id": "g"}}
+        client.entity_counts.return_value = {"Person": 2, "OperationalStaff": 3}
+
+        def post(path, payload, **kw):
+            if path == "/api/simulation/prepare":
+                prepares.append(payload)
+            return {"/api/graph/build": {"task_id": "t"}, "/api/simulation/create": {"simulation_id": "sim_s"},
+                    "/api/simulation/prepare": {"task_id": "t2", "expected_entities_count": 5},
+                    "/api/simulation/prepare/status": {"status": "completed"}}[path]
+
+        client.post.side_effect = post
+        with tempfile.TemporaryDirectory() as tmp:
+            make = lambda: mirofish_api.RunPipeline(client, "et", runs_dir=Path(tmp), log=lambda m: None,
+                                                    poll_interval_s=0.01)
+            with self.assertRaisesRegex(mirofish_api.ApiError,
+                                        r"OperationalEmployee are not in this run's graph.*OperationalStaff 3"):
+                make().run([], "q", max_rounds=10, entity_types=["Person", "OperationalEmployee"], until="prepare")
+            self.assertEqual(prepares, [])
+
+            make().run([], "q", max_rounds=10, entity_types=["Person", "OperationalStaff"], until="prepare")
+            self.assertEqual(prepares[0]["entity_types"], ["Person", "OperationalStaff"])
+            self.assertEqual(client.post_multipart.call_count, 1)  # same run: ontology and graph reused
+            with self.assertRaisesRegex(mirofish_api.ApiError, "personas were already generated"):
+                make().run([], "q", max_rounds=10, entity_types=["Person"], until="prepare")
+
     def test_single_platform_modes_refused(self):
         pipeline = mirofish_api.RunPipeline(mock.Mock(), "x", runs_dir=Path(tempfile.gettempdir()))
         for platform in ("reddit", "twitter"):

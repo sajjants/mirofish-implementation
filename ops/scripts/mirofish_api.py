@@ -175,6 +175,16 @@ class MiroFishClient:
         except (urllib.error.URLError, OSError):
             return False
 
+    def entity_counts(self, graph_id: str) -> Dict[str, int]:
+        """Typed entities in a built graph, by type (each becomes an agent); no LLM call."""
+        data = self.get(f"/api/simulation/entities/{urllib.parse.quote(graph_id)}?enrich=false")
+        counts: Dict[str, int] = {}
+        for entity in data.get("entities") or []:
+            labels = [label for label in (entity.get("labels") or []) if label not in ("Entity", "Node")]
+            kind = str(labels[0]) if labels else "unknown"
+            counts[kind] = counts.get(kind, 0) + 1
+        return counts
+
 
 def poll(fetch: Callable[[], Dict[str, Any]], is_done: Callable[[Dict[str, Any]], bool],
          label: str, timeout_s: float, interval_s: float = 5.0,
@@ -272,8 +282,17 @@ class RunPipeline:
             "entity_types": entity_types,
             "enable_graph_memory_update": enable_graph_memory_update,
         }
-        if self.manifest.get("inputs") and self.manifest["inputs"] != inputs:
-            raise ApiError(f"run {self.run_id} exists with different inputs; use a new run id")
+        previous = self.manifest.get("inputs")
+        if previous:
+            def without_types(values: Dict[str, Any]) -> Dict[str, Any]:
+                return {k: v for k, v in values.items() if k != "entity_types"}
+
+            if without_types(previous) != without_types(inputs):
+                raise ApiError(f"run {self.run_id} exists with different inputs; use a new run id")
+            prepare_status = (self.manifest.get("stages", {}).get("prepare") or {}).get("status")
+            if previous.get("entity_types") != entity_types and prepare_status in ("running", "done"):
+                raise ApiError(f"run {self.run_id}: personas were already generated for entity types "
+                               f"{previous.get('entity_types')}; use a new run id to change them")
         self.manifest.setdefault("run_id", self.run_id)
         self.manifest.setdefault("created_at", time.time())
         self.manifest["inputs"] = inputs
@@ -317,6 +336,15 @@ class RunPipeline:
         def prepare():
             payload: Dict[str, Any] = {"simulation_id": simulation_id, "use_llm_for_profiles": True}
             if entity_types:
+                # Every run generates its own ontology, so type names chosen in advance may not exist.
+                graph_counts = c.entity_counts(graph_id)
+                missing = [kind for kind in entity_types if kind not in graph_counts]
+                if missing:
+                    listing = ", ".join(f"{kind} {n}" for kind, n in
+                                        sorted(graph_counts.items(), key=lambda kv: -kv[1]))
+                    raise ApiError(f"entity type(s) {', '.join(missing)} are not in this run's graph. Entities by "
+                                   f"type: {listing}. Run the same command again with --entity-type options "
+                                   "chosen from these types, or with none to make every entity an agent.")
                 payload["entity_types"] = entity_types
             if self.manifest.pop("prepare_mismatch", False):
                 # Upstream would otherwise return the mismatched files as already prepared.
