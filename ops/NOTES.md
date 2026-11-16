@@ -183,7 +183,8 @@ npm registry, PyPI (via uv; includes the large `torch` wheel), `ghcr.io` (Docker
 - **For this project:**
   - our patches in `ops/patches/` are modifications of MiroFish and are AGPL-3.0 if distributed;
   - our wrapper scripts talk to MiroFish only over its HTTP API and its output files, and do not import its code, which normally makes them separate works;
-  - binding everything to `127.0.0.1` for single-user use keeps us clear of section 13.
+  - binding everything to `127.0.0.1` for single-user use keeps us clear of section 13;
+  - this repository, wrapper and patches alike, is licensed under AGPL-3.0 (`LICENSE` at the repository root).
 - This is a plain-language reading, not legal advice.
 
 ## 9. REST API (for scripted runs)
